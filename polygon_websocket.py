@@ -37,6 +37,10 @@ minute_aggregates = defaultdict(lambda: defaultdict(lambda: {
 # Structure: {symbol: {'prev_change_pct': float, 'prev_volume': int, 'prev_minute': datetime}}
 previous_minute_data = {}
 
+# Global dictionary to track symbols that have already been alerted to prevent spam
+# Structure: {symbol: {'last_alert_minute': datetime, 'alert_type': str, 'cooldown_minutes': int}}
+alerted_symbols = {}
+
 # Global variable to store target tickers for filtering
 target_tickers = set()
 
@@ -225,39 +229,100 @@ def get_minute_stats(symbol, minute_timestamp=None):
     
     return None
 
+def evaluate_spike_conditions(pct_change, volume):
+    """
+    Evaluate if percentage change and volume meet spike detection criteria
+    
+    Args:
+        pct_change (float): Percentage change to evaluate
+        volume (int): Trading volume to evaluate
+        
+    Returns:
+        bool: True if spike conditions are met, False otherwise
+    """    
+    return ((pct_change >= 5 and volume >= 20000) 
+            or (pct_change >= 10 and volume >= 15000) 
+            or (pct_change >= 15 and volume >= 10000)
+            or (pct_change >= 20 and volume >= 5000)
+            or (pct_change >= 30 and volume >= 2000)
+            or (pct_change >= 35) 
+            or (volume >= 100000))
+
+def should_send_alert(symbol, minute_ts, cooldown_minutes=5):
+    """
+    Check if we should send an alert for this symbol to prevent spam
+    
+    Args:
+        symbol (str): Stock symbol
+        minute_ts (datetime): Current minute timestamp
+        cooldown_minutes (int): Minutes to wait before allowing another alert
+        
+    Returns:
+        bool: True if alert should be sent, False if in cooldown period
+    """
+    global alerted_symbols
+    
+    if symbol not in alerted_symbols:
+        return True
+    
+    last_alert_time = alerted_symbols[symbol]['last_alert_minute']
+    time_diff = (minute_ts - last_alert_time).total_seconds() / 60
+    
+    return time_diff >= cooldown_minutes
+
+def mark_symbol_alerted(symbol, minute_ts):
+    """
+    Mark a symbol as alerted to track cooldown period
+    
+    Args:
+        symbol (str): Stock symbol
+        minute_ts (datetime): Current minute timestamp
+    """
+    global alerted_symbols
+    
+    alerted_symbols[symbol] = {
+        'last_alert_minute': minute_ts,
+        'cooldown_minutes': 5
+    }
+
 def check_percentage_and_volume_spike(symbol, current_change_pct, current_volume, minute_ts):
     """Check if current percentage change vs previous minute meets spike conditions"""
     global previous_minute_data
     
-    # Check if we have previous minute data for this symbol
+    spike_detected = False
+    telegram_message = ""
+    
     if symbol in previous_minute_data:
         prev_data = previous_minute_data[symbol]
         prev_change_pct = prev_data['prev_change_pct']
         prev_volume = prev_data['prev_volume']
         prev_minute = prev_data['prev_minute']
         
-        # Only check if we have data from a different minute
         if prev_minute != minute_ts:
-            # Calculate the difference in percentage change
             pct_change_diff = current_change_pct - prev_change_pct
-            # Check conditions: percentage difference > 0.1% AND current volume > 10 (adjusted for testing)
-            if ((pct_change_diff >= 5 and current_volume >= 20000) 
-            or (pct_change_diff >= 10 and current_volume >= 15000) 
-            or (pct_change_diff >= 15 and current_volume >= 10000)
-            or (pct_change_diff >= 20 and current_volume >= 5000)
-            or (pct_change_diff >= 30 and current_volume >= 2000)
-            or (pct_change_diff >= 35) or (current_volume >= 100000)):
-                # Format the Telegram message
+            
+            if evaluate_spike_conditions(pct_change_diff, current_volume):
+                spike_detected = True
                 telegram_message = (
                     f"🚨🚨 SPIKE ALERT for {symbol}! 🚨🚨\n"
                     f"📊 Previous minute: {prev_change_pct:+.2f}% (Vol: {prev_volume:,})\n"
                     f"📊 Current minute: {current_change_pct:+.2f}% (Vol: {current_volume:,})\n"
                     f"📈 Percentage difference: {pct_change_diff:+.2f}%"
                 )
-                
-                # Send to Telegram
-                send_telegram_message(telegram_message)
+    else:
+        if evaluate_spike_conditions(abs(current_change_pct), current_volume):
+            spike_detected = True
+            telegram_message = (
+                f"🚨🚨 FIRST MINUTE SPIKE ALERT for {symbol}! 🚨🚨\n"
+                f"📊 First minute data: {current_change_pct:+.2f}% (Vol: {current_volume:,})\n"
+                f"📈 Significant activity detected on first observation!"
+            )
     
+    # Send Telegram message if spike detected and not in cooldown
+    if spike_detected and should_send_alert(symbol, minute_ts):
+        send_telegram_message(telegram_message)
+        mark_symbol_alerted(symbol, minute_ts)
+
     # Update previous minute data for next comparison
     previous_minute_data[symbol] = {
         'prev_change_pct': current_change_pct,
