@@ -244,9 +244,8 @@ def evaluate_spike_conditions(pct_change, volume):
             or (pct_change >= 10 and volume >= 15000) 
             or (pct_change >= 15 and volume >= 10000)
             or (pct_change >= 20 and volume >= 5000)
-            or (pct_change >= 30 and volume >= 2000)
-            or (pct_change >= 35) 
-            or (volume >= 100000))
+            or (pct_change >= 30)
+            or (volume >= 50000))
 
 def should_send_alert(symbol, minute_ts, cooldown_minutes=5):
     """
