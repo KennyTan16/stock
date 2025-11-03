@@ -246,10 +246,10 @@ def check_percentage_and_volume_spike(symbol, current_change_pct, current_volume
             or (pct_change_diff >= 15 and current_volume >= 10000)
             or (pct_change_diff >= 20 and current_volume >= 5000)
             or (pct_change_diff >= 30 and current_volume >= 2000)
-            or (pct_change_diff >= 40) or (current_volume > 100000)):
+            or (pct_change_diff >= 35) or (current_volume >= 100000)):
                 # Format the Telegram message
                 telegram_message = (
-                    f"🚨🚨🚨 SPIKE ALERT for {symbol}! 🚨🚨🚨\n"
+                    f"🚨🚨 SPIKE ALERT for {symbol}! 🚨🚨\n"
                     f"📊 Previous minute: {prev_change_pct:+.2f}% (Vol: {prev_volume:,})\n"
                     f"📊 Current minute: {current_change_pct:+.2f}% (Vol: {current_volume:,})\n"
                     f"📈 Percentage difference: {pct_change_diff:+.2f}%"
