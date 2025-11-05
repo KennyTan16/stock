@@ -1,433 +1,409 @@
 """
-Polygon.io WebSocket Client for Real-Time Pre-Market Data
-
-Simple WebSocket client to receive real-time stock data for pre-market analysis.
-Subscribes to minute aggregates for specified tickers and displays live price updates.
+Simplified Polygon.io WebSocket Client for Pre-Market Data
+Tracks OHLC data and sends Telegram alerts for significant price movements
 """
 
 from polygon import WebSocketClient
 from polygon.websocket.models import Feed, Market
 from datetime import datetime, timedelta
 import sys
-import logging
 import csv
-from collections import defaultdict
-from typing import List
 import requests
-import urllib.parse
+import pytz
+import time
+import threading
+import json
+import os
+from collections import defaultdict
 
-# Global dictionary to store latest prices
-ticker_prices = {}
-
-# Global dictionary to store minute aggregates
-# Structure: {minute_timestamp: {symbol: {total_volume: int, total_value: float, trade_count: int, avg_price: float, open_price: float, close_price: float, high_price: float, low_price: float, open_close_change_pct: float}}}
-minute_aggregates = defaultdict(lambda: defaultdict(lambda: {
-    'total_volume': 0, 
-    'total_value': 0, 
-    'trade_count': 0, 
-    'avg_price': 0,
-    'open_price': None,
-    'close_price': 0,
-    'high_price': None,
-    'low_price': None,
-    'open_close_change_pct': 0
-}))
-
-# Global dictionary to store previous minute data for comparison
-# Structure: {symbol: {'prev_change_pct': float, 'prev_volume': int, 'prev_minute': datetime}}
-previous_minute_data = {}
-
-# Global dictionary to track symbols that have already been alerted to prevent spam
-# Structure: {symbol: {'last_alert_minute': datetime, 'alert_type': str, 'cooldown_minutes': int}}
-alerted_symbols = {}
-
-# Global variable to store target tickers for filtering
-target_tickers = set()
-
-# Telegram configuration
+# Configuration
+API_KEY = "3z93jv2EOJ9d7KrEbdnXzCaBfUQJBBoW"
 TELEGRAM_BOT_TOKEN = "8230689629:AAHtpdsVb8znDZ_DyKMzcOgee-aczA9acOE"
 TELEGRAM_CHAT_ID = "8258742558"
+PRE_MARKET_START = "03:59"
+PRE_MARKET_END = "09:30"
+ALERT_COOLDOWN_MINUTES = 5
+DATA_FILE = "symbol_tracking_data.json"
 
-def send_telegram_message(message):
-    """Send message to Telegram chat"""
-    try:
-        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-        
-        payload = {
-            'chat_id': TELEGRAM_CHAT_ID,
-            'text': message,
-            'parse_mode': 'HTML'
-        }
-        
-        response = requests.post(url, data=payload, timeout=10)
-        
-        if response.status_code == 200:
-            print("✅ Telegram message sent successfully")
-            return True
-        else:
-            print(f"❌ Failed to send Telegram message: {response.status_code} - {response.text}")
-            return False
-            
-    except Exception as e:
-        print(f"❌ Error sending Telegram message: {e}")
+# Timezone
+ET_TIMEZONE = pytz.timezone('US/Eastern')
+
+# Global data structures
+target_tickers = set()
+minute_aggregates = defaultdict(lambda: defaultdict(lambda: {
+    'open': None, 'close': 0, 'high': None, 'low': None,
+    'volume': 0, 'value': 0, 'count': 0
+}))
+# Track both first occurrence (baseline) and previous minute for each symbol
+symbol_data = {}  # {symbol: {'first': {'pct': float, 'vol': int, 'open': float, 'close': float, 'time': datetime}, 'prev': {'pct': float, 'vol': int, 'open': float, 'close': float, 'time': datetime}}}
+alert_tracker = {}  # {symbol: datetime} - last alert time
+data_lock = threading.Lock()
+telegram_lock = threading.Lock()
+
+def get_et_time():
+    """Get current Eastern Time"""
+    return datetime.now(ET_TIMEZONE)
+
+def is_premarket_session():
+    """Check if currently in pre-market (4:00 AM - 9:30 AM ET, weekdays)"""
+    dt = get_et_time()
+    if dt.weekday() >= 5:
         return False
-
-def read_tickers_from_csv(filepath: str) -> List[str]:
-    """
-    Read ticker symbols from a CSV file.
     
-    Args:
-        filepath (str): Path to the CSV file containing ticker symbols
-        
-    Returns:
-        List[str]: List of ticker symbols
-    """
+    current_time = dt.time()
+    start = datetime.strptime(PRE_MARKET_START, "%H:%M").time()
+    end = datetime.strptime(PRE_MARKET_END, "%H:%M").time()
+    return start <= current_time < end
+
+def get_next_premarket():
+    """Get next pre-market start time"""
+    now = get_et_time()
+    today_start = ET_TIMEZONE.localize(
+        datetime.combine(now.date(), datetime.strptime(PRE_MARKET_START, "%H:%M").time())
+    )
+    
+    if now < today_start and now.weekday() < 5:
+        return today_start
+    
+    # Find next weekday
+    next_day = now.date() + timedelta(days=1)
+    while next_day.weekday() >= 5:
+        next_day += timedelta(days=1)
+    
+    return ET_TIMEZONE.localize(
+        datetime.combine(next_day, datetime.strptime(PRE_MARKET_START, "%H:%M").time())
+    )
+
+def read_tickers(filepath):
+    """Read ticker symbols from CSV"""
     tickers = []
     try:
-        with open(filepath, 'r', encoding='utf-8') as file:
-            csv_reader = csv.reader(file)
-            for row in csv_reader:
-                if row:  # Check if row is not empty
-                    # Take the first column and clean it
+        with open(filepath, 'r') as f:
+            for row in csv.reader(f):
+                if row:
                     ticker = row[0].strip().upper()
-                    if ticker and ticker != "SYMBOL":  # Skip header if it exists
+                    if ticker and ticker != "SYMBOL":
                         tickers.append(ticker)
-        return tickers
     except Exception as e:
-        print(f"Error reading CSV file: {e}")
-        return []
-    
-def convert_timestamp_to_datetime(timestamp):
-    """Convert various timestamp formats to datetime object"""
-    if timestamp:
-        if isinstance(timestamp, int):
-            # Handle both millisecond and nanosecond timestamps
-            if timestamp > 1000000000000000:  # Nanoseconds
-                return datetime.fromtimestamp(timestamp / 1000000000)
-            elif timestamp > 1000000000000:  # Milliseconds
-                return datetime.fromtimestamp(timestamp / 1000)
-            else:  # Seconds
-                return datetime.fromtimestamp(timestamp)
-        else:
-            return timestamp
-    else:
-        return datetime.now()
-    
-def get_minute_timestamp(timestamp):
-    """Convert timestamp to minute-level timestamp (remove seconds)"""
+        print(f"Error reading tickers: {e}")
+    return tickers
+
+def get_minute_ts(timestamp):
+    """Convert timestamp to minute-level datetime"""
     if isinstance(timestamp, int):
-        # Handle both millisecond and nanosecond timestamps
         if timestamp > 1000000000000000:  # Nanoseconds
-            dt = datetime.fromtimestamp(timestamp / 1000000000)
+            dt = datetime.fromtimestamp(timestamp / 1e9)
         elif timestamp > 1000000000000:  # Milliseconds
             dt = datetime.fromtimestamp(timestamp / 1000)
-        else:  # Seconds
+        else:
             dt = datetime.fromtimestamp(timestamp)
     else:
         dt = timestamp
-    
-    # Round down to the minute (set seconds and microseconds to 0)
-    minute_dt = dt.replace(second=0, microsecond=0)
-    return minute_dt
+    return dt.replace(second=0, microsecond=0)
 
+def send_telegram(message):
+    """Send Telegram message with rate limiting"""
+    with telegram_lock:
+        try:
+            url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+            response = requests.post(
+                url,
+                data={'chat_id': TELEGRAM_CHAT_ID, 'text': message, 'parse_mode': 'HTML'},
+                timeout=10
+            )
+            return response.status_code == 200
+        except Exception as e:
+            print(f"Telegram error: {e}")
+            return False
 
-def handle_msg(msg):
-    """Handle incoming WebSocket messages"""
-    global ticker_prices
-    
-    if isinstance(msg, list):
-        # Handle multiple messages
-        for message in msg:
-            process_message(message)
-    else:
-        # Handle single message
-        process_message(msg)
-
-def update_minute_aggregates(symbol, trade_price, trade_size, dt):
-    """Update minute-level trade aggregates with OHLC data and percentage change"""
-    global minute_aggregates
-    
-    minute_ts = get_minute_timestamp(dt)
-    trade_value = trade_price * trade_size
-    
-    agg = minute_aggregates[minute_ts][symbol]
-    
-    # Update volume and value aggregates
-    agg['total_volume'] += trade_size
-    agg['total_value'] += trade_value
-    agg['trade_count'] += 1
-    
-    # Set opening price (first trade of the minute)
-    if agg['open_price'] is None:
-        agg['open_price'] = trade_price
-    
-    # Always update closing price (last trade becomes close)
-    agg['close_price'] = trade_price
-    
-    # Update high and low prices
-    if agg['high_price'] is None or trade_price > agg['high_price']:
-        agg['high_price'] = trade_price
-    if agg['low_price'] is None or trade_price < agg['low_price']:
-        agg['low_price'] = trade_price
-    
-    # Calculate average price
-    if agg['total_volume'] > 0:
-        agg['avg_price'] = agg['total_value'] / agg['total_volume']
-    
-    # Calculate open-to-close percentage change for the minute
-    if agg['open_price'] and agg['open_price'] > 0:
-        price_change = agg['close_price'] - agg['open_price']
-        agg['open_close_change_pct'] = (price_change / agg['open_price']) * 100
-    
-    return minute_ts, agg
-
-def update_latest_prices(symbol, price, size, timestamp, dt, **kwargs):
-    """Update the latest price dictionary"""
-    global ticker_prices
-    
-    time_str = dt.strftime('%H:%M:%S.%f')[:-3]
-    ticker_prices[symbol] = {
-        'price': price,
-        'size': size,
-        'time': time_str,
-        'timestamp': timestamp,
-        **kwargs
-    }
-
-
-def get_minute_stats(symbol, minute_timestamp=None):
-    """Get minute statistics for a specific symbol and minute"""
-    global minute_aggregates
-    
-    if minute_timestamp is None:
-        # Get the latest minute for this symbol
-        symbol_minutes = []
-        for minute_ts, symbols in minute_aggregates.items():
-            if symbol in symbols:
-                symbol_minutes.append(minute_ts)
-        
-        if not symbol_minutes:
-            return None
-        
-        minute_timestamp = max(symbol_minutes)
-    
-    if minute_timestamp in minute_aggregates and symbol in minute_aggregates[minute_timestamp]:
-        agg = minute_aggregates[minute_timestamp][symbol]
-        return {
-            'symbol': symbol,
-            'minute': minute_timestamp,
-            'open_price': agg['open_price'],
-            'close_price': agg['close_price'],
-            'high_price': agg['high_price'],
-            'low_price': agg['low_price'],
-            'volume': agg['total_volume'],
-            'avg_price': agg['avg_price'],
-            'trade_count': agg['trade_count'],
-            'open_close_change_pct': agg['open_close_change_pct'],
-            'open_close_change_dollar': agg['close_price'] - agg['open_price'] if agg['open_price'] else 0
-        }
-    
-    return None
-
-def evaluate_spike_conditions(pct_change, volume):
-    """
-    Evaluate if percentage change and volume meet spike detection criteria
-    
-    Args:
-        pct_change (float): Percentage change to evaluate
-        volume (int): Trading volume to evaluate
-        
-    Returns:
-        bool: True if spike conditions are met, False otherwise
-    """    
-    return ((pct_change >= 5 and volume >= 20000) 
-            or (pct_change >= 10 and volume >= 15000) 
-            or (pct_change >= 15 and volume >= 10000)
-            or (pct_change >= 20 and volume >= 5000)
-            or (pct_change >= 30)
-            or (volume >= 50000))
-
-def should_send_alert(symbol, minute_ts, cooldown_minutes=5):
-    """
-    Check if we should send an alert for this symbol to prevent spam
-    
-    Args:
-        symbol (str): Stock symbol
-        minute_ts (datetime): Current minute timestamp
-        cooldown_minutes (int): Minutes to wait before allowing another alert
-        
-    Returns:
-        bool: True if alert should be sent, False if in cooldown period
-    """
-    global alerted_symbols
-    
-    if symbol not in alerted_symbols:
+def can_send_alert(symbol, minute_ts):
+    """Check if alert can be sent (respects cooldown)"""
+    if symbol not in alert_tracker:
         return True
     
-    last_alert_time = alerted_symbols[symbol]['last_alert_minute']
-    time_diff = (minute_ts - last_alert_time).total_seconds() / 60
-    
-    return time_diff >= cooldown_minutes
+    last_alert = alert_tracker[symbol]
+    minutes_since = (minute_ts - last_alert).total_seconds() / 60
+    return minutes_since >= ALERT_COOLDOWN_MINUTES
 
-def mark_symbol_alerted(symbol, minute_ts):
-    """
-    Mark a symbol as alerted to track cooldown period
-    
-    Args:
-        symbol (str): Stock symbol
-        minute_ts (datetime): Current minute timestamp
-    """
-    global alerted_symbols
-    
-    alerted_symbols[symbol] = {
-        'last_alert_minute': minute_ts,
-        'cooldown_minutes': 5
-    }
+def mark_alerted(symbol, minute_ts):
+    """Mark symbol as alerted"""
+    alert_tracker[symbol] = minute_ts
 
-def check_percentage_and_volume_spike(symbol, current_change_pct, current_volume, minute_ts):
-    """Check if current percentage change vs previous minute meets spike conditions"""
-    global previous_minute_data
-    
-    spike_detected = False
-    telegram_message = ""
-    
-    if symbol in previous_minute_data:
-        prev_data = previous_minute_data[symbol]
-        prev_change_pct = prev_data['prev_change_pct']
-        prev_volume = prev_data['prev_volume']
-        prev_minute = prev_data['prev_minute']
+def save_previous_minute():
+    """Save symbol tracking data to JSON file (first occurrence + previous minute)"""
+    try:
+        with data_lock:
+            # Convert datetime objects to ISO format strings
+            save_data = {}
+            for symbol, data in symbol_data.items():
+                save_data[symbol] = {}
+                
+                # Save first occurrence (baseline)
+                if 'first' in data:
+                    save_data[symbol]['first'] = {
+                        'pct': data['first']['pct'],
+                        'vol': data['first']['vol'],
+                        'open': data['first']['open'],
+                        'close': data['first']['close'],
+                        'time': data['first']['time'].isoformat()
+                    }
+                
+                # Save previous minute
+                if 'prev' in data:
+                    save_data[symbol]['prev'] = {
+                        'pct': data['prev']['pct'],
+                        'vol': data['prev']['vol'],
+                        'open': data['prev']['open'],
+                        'close': data['prev']['close'],
+                        'time': data['prev']['time'].isoformat()
+                    }
         
-        if prev_minute != minute_ts:
-            pct_change_diff = current_change_pct - prev_change_pct
-            
-            if evaluate_spike_conditions(pct_change_diff, current_volume):
-                spike_detected = True
-                telegram_message = (
-                    f"🚨🚨 SPIKE ALERT for {symbol}! 🚨🚨\n"
-                    f"📊 Previous minute: {prev_change_pct:+.2f}% (Vol: {prev_volume:,})\n"
-                    f"📊 Current minute: {current_change_pct:+.2f}% (Vol: {current_volume:,})\n"
-                    f"📈 Percentage difference: {pct_change_diff:+.2f}%"
-                )
-    else:
-        if evaluate_spike_conditions(abs(current_change_pct), current_volume):
-            spike_detected = True
-            telegram_message = (
-                f"🚨🚨 FIRST MINUTE SPIKE ALERT for {symbol}! 🚨🚨\n"
-                f"📊 First minute data: {current_change_pct:+.2f}% (Vol: {current_volume:,})\n"
-                f"📈 Significant activity detected on first observation!"
-            )
-    
-    # Send Telegram message if spike detected and not in cooldown
-    if spike_detected and should_send_alert(symbol, minute_ts):
-        send_telegram_message(telegram_message)
-        mark_symbol_alerted(symbol, minute_ts)
-
-    # Update previous minute data for next comparison
-    previous_minute_data[symbol] = {
-        'prev_change_pct': current_change_pct,
-        'prev_volume': current_volume,
-        'prev_minute': minute_ts
-    }
-    
-def process_trade_message(msg):
-    """Process trade message"""
-    symbol = getattr(msg, 'symbol', 'Unknown')
-    
-    # Filter: Only process trades for tickers in our list
-    if symbol not in target_tickers:
-        return
+        with open(DATA_FILE, 'w') as f:
+            json.dump(save_data, f, indent=2)
         
-    trade_price = getattr(msg, 'price', 0)
-    trade_size = getattr(msg, 'size', 0)
-    timestamp = getattr(msg, 'timestamp', None)
-    exchange = getattr(msg, 'exchange', None)
-    conditions = getattr(msg, 'conditions', [])
-    tape = getattr(msg, 'tape', None)
-    
-    # Convert timestamp
-    dt = convert_timestamp_to_datetime(timestamp)
-    
-    # Update aggregates
-    minute_ts, agg = update_minute_aggregates(symbol, trade_price, trade_size, dt)
-    
-    # Update latest prices
-    update_latest_prices(symbol, trade_price, trade_size, timestamp, dt, 
-                        exchange=exchange, conditions=conditions, tape=tape)
-    
-    # Check for percentage and volume spike conditions
-    check_percentage_and_volume_spike(
-        symbol, 
-        agg['open_close_change_pct'], 
-        agg['total_volume'], 
-        minute_ts
-    )
-        
+        print(f"✓ Saved data for {len(save_data)} symbols")
+        return True
+    except Exception as e:
+        print(f"Save error: {e}")
+        return False
 
-def process_aggregate_message(msg):
-    """Process aggregate message (fallback)"""
-    symbol = getattr(msg, 'symbol', 'Unknown')
-    
-    # Filter: Only process aggregates for tickers in our list
-    if symbol not in target_tickers:
-        return
-        
-    close_price = getattr(msg, 'close', 0)
-    volume = getattr(msg, 'volume', 0)
-    timestamp = getattr(msg, 'timestamp', None)
-    
-    # Convert timestamp
-    dt = convert_timestamp_to_datetime(timestamp)
-    
-    # Update latest prices
-    update_latest_prices(symbol, close_price, volume, timestamp, dt)
-    
-    # Simple aggregate notification
-    print(f"📊 {symbol}: ${close_price:.2f} (Vol: {volume:,})")
-
-def process_message(msg):
-    """Process individual WebSocket message for trade data"""
-    global target_tickers
+def load_previous_minute():
+    """Load symbol tracking data from JSON file (first occurrence + previous minute)"""
+    if not os.path.exists(DATA_FILE):
+        print("📂 No previous data found")
+        return False
     
     try:
-        if hasattr(msg, 'symbol') and hasattr(msg, 'price'):
-            # Handle Trade object
-            process_trade_message(msg)
-        elif hasattr(msg, 'symbol') and hasattr(msg, 'close'):
-            # Handle EquityAgg object (fallback)
-            process_aggregate_message(msg)
-        else:
-            # Unknown message type - minimal logging
-            print(f"🔍 Unknown message type: {type(msg)}")
-                        
+        with open(DATA_FILE, 'r') as f:
+            save_data = json.load(f)
+        
+        with data_lock:
+            symbol_data.clear()
+            for symbol, data in save_data.items():
+                symbol_data[symbol] = {}
+                
+                # Load first occurrence (baseline)
+                if 'first' in data:
+                    symbol_data[symbol]['first'] = {
+                        'pct': data['first']['pct'],
+                        'vol': data['first']['vol'],
+                        'open': data['first']['open'],
+                        'close': data['first']['close'],
+                        'time': datetime.fromisoformat(data['first']['time'])
+                    }
+                
+                # Load previous minute
+                if 'prev' in data:
+                    symbol_data[symbol]['prev'] = {
+                        'pct': data['prev']['pct'],
+                        'vol': data['prev']['vol'],
+                        'open': data['prev']['open'],
+                        'close': data['prev']['close'],
+                        'time': datetime.fromisoformat(data['prev']['time'])
+                    }
+        
+        print(f"✓ Loaded data for {len(save_data)} symbols")
+        return True
     except Exception as e:
-        print(f"❌ Error processing message: {e}")
-        # Reduced error logging
-        if hasattr(msg, 'symbol'):
-            print(f"   Symbol: {getattr(msg, 'symbol', 'Unknown')}")
+        print(f"Load error: {e}")
+        return False
 
-def handle_error(error):
-    """Handle WebSocket errors"""
-    print(f"\n❌ WebSocket Error: {error}")
+def should_alert(pct_change, volume, prev_volume=None):
+    """Check if conditions meet alert criteria"""
+    if prev_volume is not None:
+        volume_ratio = volume / prev_volume
+        return (
+            (volume_ratio >= 100 and volume >= 1000)
+        )
+    else:
+        # If prev_volume is None or 0 (gap in data), use stricter criteria
+        return (
+            (pct_change >= 0 and volume >= 50000) or
+            (pct_change >= 10 and volume >= 20000) or
+            (pct_change >= 20 and volume >= 10000) or
+            (pct_change >= 30 and volume >= 5000)
+        )
 
-def main():
-    """Main function to start WebSocket connection"""
-    global target_tickers
+def check_spike(symbol, current_pct, current_vol, minute_ts, open_price, close_price):
+    """Check for spike and send alert if conditions met"""
+    spike = False
+    message = ""
     
-    # Setup logging
-    logging.basicConfig(level=logging.INFO)
+    with data_lock:
+        if symbol in symbol_data:
+            # Symbol has been seen before
+            data = symbol_data[symbol]
+            
+            # Check if we have previous minute data
+            if 'prev' in data:
+                prev = data['prev']
+                
+                # Only check if new minute
+                if prev['time'] != minute_ts:
+                    expected_prev_time = minute_ts - timedelta(minutes=1)
+                    is_consecutive = (prev['time'] == expected_prev_time)
+                    
+                    pct_diff = current_pct - prev['pct']
+                    
+                    prev_vol = prev['vol'] if is_consecutive else 1
+                    
+                    if should_alert(pct_diff, current_vol, prev_vol):
+                        spike = True
+                        first = data.get('first', prev)
+                        
+                        # Show different message based on whether prev is consecutive
+                        if is_consecutive:
+                            message = (
+                                f"🚨 SPIKE: {symbol}\n"
+                                f"Base: ${first['open']:.2f} @ {first['time'].strftime('%H:%M')} (0.00%)\n"
+                                f"Prev: {prev['pct']:+.2f}% ({prev['vol']:,}) @ {prev['time'].strftime('%H:%M')}\n"
+                                f"Now: {current_pct:+.2f}% ({current_vol:,}) @ {minute_ts.strftime('%H:%M')}\n"
+                                f"Δ Change: {pct_diff:+.2f}%\n"
+                                f"Current Price: ${close_price:.2f}"
+                            )
+                        else:
+                            message = (
+                                f"🚨 SPIKE: {symbol}\n"
+                                f"Base: ${first['open']:.2f} @ {first['time'].strftime('%H:%M')} (0.00%)\n"
+                                f"Last: {prev['pct']:+.2f}% @ {prev['time'].strftime('%H:%M')} (gap)\n"
+                                f"Now: {current_pct:+.2f}% ({current_vol:,}) @ {minute_ts.strftime('%H:%M')}\n"
+                                f"Δ Change: {pct_diff:+.2f}%\n"
+                                f"Current Price: ${close_price:.2f}"
+                            )
+                    
+                    # Update previous minute
+                    symbol_data[symbol]['prev'] = {
+                        'pct': current_pct,
+                        'vol': current_vol,
+                        'open': open_price,
+                        'close': close_price,
+                        'time': minute_ts
+                    }
+                else:
+                    # Same minute - just update the values
+                    symbol_data[symbol]['prev'] = {
+                        'pct': current_pct,
+                        'vol': current_vol,
+                        'open': open_price,
+                        'close': close_price,
+                        'time': minute_ts
+                    }
+            else:
+                # Have first occurrence but no prev minute yet (shouldn't happen, but handle it)
+                symbol_data[symbol]['prev'] = {
+                    'pct': current_pct,
+                    'vol': current_vol,
+                    'open': open_price,
+                    'close': close_price,
+                    'time': minute_ts
+                }
+        else:
+            # First observation for this symbol - store as both first and prev
+            if should_alert(current_pct, current_vol):
+                spike = True
+                message = (
+                    f"🚨 FIRST SPIKE: {symbol}\n"
+                    f"Data: {current_pct:+.2f}% ({current_vol:,})\n"
+                    f"Open: ${open_price:.2f} → Close: ${close_price:.2f}"
+                )
+            
+            # Store first occurrence (baseline) with prices and current as prev
+            symbol_data[symbol] = {
+                'first': {
+                    'pct': current_pct,
+                    'vol': current_vol,
+                    'open': open_price,
+                    'close': close_price,
+                    'time': minute_ts
+                },
+                'prev': {
+                    'pct': current_pct,
+                    'vol': current_vol,
+                    'open': open_price,
+                    'close': close_price,
+                    'time': minute_ts
+                }
+            }
     
-    # Your API key
-    API_KEY = "3z93jv2EOJ9d7KrEbdnXzCaBfUQJBBoW"
+    # Send alert if spike detected and not in cooldown
+    if spike and can_send_alert(symbol, minute_ts):
+        if send_telegram(message):
+            mark_alerted(symbol, minute_ts)
+            print(f"✓ Alert sent: {symbol}")
+
+def update_aggregates(symbol, price, size, timestamp):
+    """Update minute-level aggregates"""
+    minute_ts = get_minute_ts(timestamp)
     
-    # Set global target tickers for filtering
-    target_tickers = set(read_tickers_from_csv("tickers.csv"))
+    with data_lock:
+        agg = minute_aggregates[minute_ts][symbol]
+        
+        # Update OHLC
+        if agg['open'] is None:
+            agg['open'] = price
+        agg['close'] = price
+        
+        if agg['high'] is None or price > agg['high']:
+            agg['high'] = price
+        if agg['low'] is None or price < agg['low']:
+            agg['low'] = price
+        
+        # Update volume
+        agg['volume'] += size
+        agg['value'] += price * size
+        agg['count'] += 1
+        
+        # Calculate percentage change from baseline (first occurrence open price)
+        # If no baseline yet, use minute's own open price
+        base_price = None
+        if symbol in symbol_data and 'first' in symbol_data[symbol]:
+            base_price = symbol_data[symbol]['first']['open']
+        else:
+            base_price = agg['open']
+        
+        pct_change = 0
+        if base_price and base_price > 0:
+            pct_change = ((agg['close'] - base_price) / base_price) * 100
+        
+        return minute_ts, agg['volume'], pct_change, agg['open'], agg['close']
+
+def handle_msg(msgs):
+    """Handle incoming WebSocket messages"""
+    if not isinstance(msgs, list):
+        msgs = [msgs]
     
-    print(f"\n🚀 Starting WebSocket for Real-Time Trade Data")
-    print(f"📈 Tracking OHLC data and open-to-close percentage changes per minute")
-    print(f"🎯 Monitoring {len(target_tickers)} tickers from tickers.csv")
-    print("\nPress Ctrl+C to stop\n")
+    for msg in msgs:
+        try:
+            # Only process trade messages for target tickers
+            if not hasattr(msg, 'symbol') or not hasattr(msg, 'price'):
+                continue
+            
+            symbol = msg.symbol
+            if symbol not in target_tickers:
+                continue
+            
+            price = msg.price
+            size = msg.size
+            timestamp = msg.timestamp
+            
+            # Update aggregates and check for spike
+            minute_ts, volume, pct_change, open_price, close_price = update_aggregates(symbol, price, size, timestamp)
+            check_spike(symbol, pct_change, volume, minute_ts, open_price, close_price)
+            
+        except Exception as e:
+            print(f"Error processing message: {e}")
+
+def run_session():
+    """Run WebSocket session during pre-market"""
+    print(f"✓ Session started: {get_et_time().strftime('%H:%M:%S ET')}")
     
-    # Create WebSocket client
+    # Load previous data if available
+    load_previous_minute()
+    
+    # Clear alert tracker for new session
+    with data_lock:
+        alert_tracker.clear()
+    
     try:
         client = WebSocketClient(
             api_key=API_KEY,
@@ -435,18 +411,65 @@ def main():
             market=Market.Stocks
         )
         
+        # Subscribe to all trades
         client.subscribe('T.*')
         
-        # Start the connection
-        client.run(handle_msg)
+        # Run in background thread
+        ws_running = [True]
         
-    except KeyboardInterrupt:
-        print(f"\n🛑 Shutting down WebSocket connection...")
-        sys.exit(0)
-
+        def ws_runner():
+            try:
+                client.run(handle_msg)
+            except Exception as e:
+                print(f"WebSocket error: {e}")
+                ws_running[0] = False
+        
+        ws_thread = threading.Thread(target=ws_runner, daemon=True)
+        ws_thread.start()
+        
+        # Monitor session
+        while is_premarket_session() and ws_running[0]:
+            time.sleep(5)
+        
+        ws_running[0] = False
+        print(f"✓ Session ended: {get_et_time().strftime('%H:%M:%S ET')}")
+        
+        # Save data at end of session
+        save_previous_minute()
+        
     except Exception as e:
-        print(f"\n❌ Connection error: {e}")
-        sys.exit(1)
+        print(f"Session error: {e}")
+
+def main():
+    """Main function"""
+    global target_tickers
+    
+    print("🚀 Pre-Market Monitor")
+    print(f"⏰ Active: {PRE_MARKET_START} - {PRE_MARKET_END} ET")
+    
+    # Load tickers
+    target_tickers = set(read_tickers("tickers.csv"))
+    print(f"📊 Monitoring {len(target_tickers)} tickers")
+    
+    try:
+        while True:
+            if is_premarket_session():
+                run_session()
+            else:
+                next_session = get_next_premarket()
+                wait_time = (next_session - get_et_time()).total_seconds()
+                
+                hours = int(wait_time // 3600)
+                minutes = int((wait_time % 3600) // 60)
+                
+                print(f"💤 Next session: {next_session.strftime('%Y-%m-%d %H:%M ET')} ({hours}h {minutes}m)")
+                time.sleep(min(300, max(1, wait_time - 10)))  # Check every 5 min or sooner
+                
+    except KeyboardInterrupt:
+        print("\n💾 Saving data before exit...")
+        save_previous_minute()
+        print("✓ Shutdown complete")
+        sys.exit(0)
 
 if __name__ == "__main__":
     main()
