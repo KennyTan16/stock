@@ -34,8 +34,6 @@ minute_aggregates = defaultdict(lambda: defaultdict(lambda: {
     'open': None, 'close': 0, 'high': None, 'low': None,
     'volume': 0, 'value': 0, 'count': 0
 }))
-# Track both first occurrence (baseline) and previous minute for each symbol
-symbol_data = {}  # {symbol: {'first': {'pct': float, 'vol': int, 'open': float, 'close': float, 'time': datetime}, 'prev': {'pct': float, 'vol': int, 'open': float, 'close': float, 'time': datetime}}}
 alert_tracker = {}  # {symbol: datetime} - last alert time
 data_lock = threading.Lock()
 telegram_lock = threading.Lock()
@@ -130,206 +128,81 @@ def mark_alerted(symbol, minute_ts):
     alert_tracker[symbol] = minute_ts
 
 def save_previous_minute():
-    """Save symbol tracking data to JSON file (first occurrence + previous minute)"""
+    """Save minute aggregates to JSON file"""
     try:
-        with data_lock:
-            # Convert datetime objects to ISO format strings
-            save_data = {}
-            for symbol, data in symbol_data.items():
-                save_data[symbol] = {}
-                
-                # Save first occurrence (baseline)
-                if 'first' in data:
-                    save_data[symbol]['first'] = {
-                        'pct': data['first']['pct'],
-                        'vol': data['first']['vol'],
-                        'open': data['first']['open'],
-                        'close': data['first']['close'],
-                        'time': data['first']['time'].isoformat()
-                    }
-                
-                # Save previous minute
-                if 'prev' in data:
-                    save_data[symbol]['prev'] = {
-                        'pct': data['prev']['pct'],
-                        'vol': data['prev']['vol'],
-                        'open': data['prev']['open'],
-                        'close': data['prev']['close'],
-                        'time': data['prev']['time'].isoformat()
-                    }
+        filename = f"minute_data_{get_et_time().strftime('%Y%m%d')}.json"
         
-        with open(DATA_FILE, 'w') as f:
+        with data_lock:
+            # Convert to serializable format
+            save_data = {}
+            for minute_ts, symbols in minute_aggregates.items():
+                minute_key = minute_ts.strftime('%Y-%m-%d %H:%M:%S')
+                save_data[minute_key] = {}
+                for symbol, agg in symbols.items():
+                    save_data[minute_key][symbol] = dict(agg)
+        
+        with open(filename, 'w') as f:
             json.dump(save_data, f, indent=2)
         
-        print(f"✓ Saved data for {len(save_data)} symbols")
+        print(f"✓ Saved {len(save_data)} minutes of data")
         return True
     except Exception as e:
         print(f"Save error: {e}")
         return False
 
 def load_previous_minute():
-    """Load symbol tracking data from JSON file (first occurrence + previous minute)"""
-    if not os.path.exists(DATA_FILE):
+    """Load minute aggregates from JSON file"""
+    filename = f"minute_data_{get_et_time().strftime('%Y%m%d')}.json"
+    
+    if not os.path.exists(filename):
         print("📂 No previous data found")
         return False
     
     try:
-        with open(DATA_FILE, 'r') as f:
+        with open(filename, 'r') as f:
             save_data = json.load(f)
         
         with data_lock:
-            symbol_data.clear()
-            for symbol, data in save_data.items():
-                symbol_data[symbol] = {}
-                
-                # Load first occurrence (baseline)
-                if 'first' in data:
-                    symbol_data[symbol]['first'] = {
-                        'pct': data['first']['pct'],
-                        'vol': data['first']['vol'],
-                        'open': data['first']['open'],
-                        'close': data['first']['close'],
-                        'time': datetime.fromisoformat(data['first']['time'])
-                    }
-                
-                # Load previous minute
-                if 'prev' in data:
-                    symbol_data[symbol]['prev'] = {
-                        'pct': data['prev']['pct'],
-                        'vol': data['prev']['vol'],
-                        'open': data['prev']['open'],
-                        'close': data['prev']['close'],
-                        'time': datetime.fromisoformat(data['prev']['time'])
-                    }
+            minute_aggregates.clear()
+            for minute_key, symbols in save_data.items():
+                minute_ts = datetime.strptime(minute_key, '%Y-%m-%d %H:%M:%S')
+                for symbol, agg in symbols.items():
+                    minute_aggregates[minute_ts][symbol] = agg
         
-        print(f"✓ Loaded data for {len(save_data)} symbols")
+        print(f"✓ Loaded {len(save_data)} minutes of data")
         return True
     except Exception as e:
         print(f"Load error: {e}")
         return False
 
-def should_alert(pct_change, volume, prev_volume=None):
-    """Check if conditions meet alert criteria"""
-    if prev_volume is not None:
-        volume_ratio = volume / prev_volume
-        return (
-            (volume_ratio >= 100 and volume >= 1000)
-        )
-    else:
-        # If prev_volume is None or 0 (gap in data), use stricter criteria
-        return (
-            (pct_change >= 0 and volume >= 50000) or
-            (pct_change >= 10 and volume >= 20000) or
-            (pct_change >= 20 and volume >= 10000) or
-            (pct_change >= 30 and volume >= 5000)
-        )
+def should_alert(pct_change, volume):
+    """Check if conditions meet alert criteria - based on current minute only"""
+    return (
+        (pct_change >= 5 and volume >= 20000) or
+        (pct_change >= 10 and volume >= 15000) or
+        (pct_change >= 15 and volume >= 10000) or
+        (pct_change >= 20 and volume >= 5000) or
+        (pct_change >= 30 and volume >= 1000) or
+        (volume >= 50000)
+    )
 
 def check_spike(symbol, current_pct, current_vol, minute_ts, open_price, close_price):
-    """Check for spike and send alert if conditions met"""
-    spike = False
-    message = ""
+    """Check for spike and send alert if conditions met - current minute only"""
     
-    with data_lock:
-        if symbol in symbol_data:
-            # Symbol has been seen before
-            data = symbol_data[symbol]
-            
-            # Check if we have previous minute data
-            if 'prev' in data:
-                prev = data['prev']
-                
-                # Only check if new minute
-                if prev['time'] != minute_ts:
-                    expected_prev_time = minute_ts - timedelta(minutes=1)
-                    is_consecutive = (prev['time'] == expected_prev_time)
-                    
-                    pct_diff = current_pct - prev['pct']
-                    
-                    prev_vol = prev['vol'] if is_consecutive else 1
-                    
-                    if should_alert(pct_diff, current_vol, prev_vol):
-                        spike = True
-                        first = data.get('first', prev)
-                        
-                        # Show different message based on whether prev is consecutive
-                        if is_consecutive:
-                            message = (
-                                f"🚨 SPIKE: {symbol}\n"
-                                f"Base: ${first['open']:.2f} @ {first['time'].strftime('%H:%M')} (0.00%)\n"
-                                f"Prev: {prev['pct']:+.2f}% ({prev['vol']:,}) @ {prev['time'].strftime('%H:%M')}\n"
-                                f"Now: {current_pct:+.2f}% ({current_vol:,}) @ {minute_ts.strftime('%H:%M')}\n"
-                                f"Δ Change: {pct_diff:+.2f}%\n"
-                                f"Current Price: ${close_price:.2f}"
-                            )
-                        else:
-                            message = (
-                                f"🚨 SPIKE: {symbol}\n"
-                                f"Base: ${first['open']:.2f} @ {first['time'].strftime('%H:%M')} (0.00%)\n"
-                                f"Last: {prev['pct']:+.2f}% @ {prev['time'].strftime('%H:%M')} (gap)\n"
-                                f"Now: {current_pct:+.2f}% ({current_vol:,}) @ {minute_ts.strftime('%H:%M')}\n"
-                                f"Δ Change: {pct_diff:+.2f}%\n"
-                                f"Current Price: ${close_price:.2f}"
-                            )
-                    
-                    # Update previous minute
-                    symbol_data[symbol]['prev'] = {
-                        'pct': current_pct,
-                        'vol': current_vol,
-                        'open': open_price,
-                        'close': close_price,
-                        'time': minute_ts
-                    }
-                else:
-                    # Same minute - just update the values
-                    symbol_data[symbol]['prev'] = {
-                        'pct': current_pct,
-                        'vol': current_vol,
-                        'open': open_price,
-                        'close': close_price,
-                        'time': minute_ts
-                    }
-            else:
-                # Have first occurrence but no prev minute yet (shouldn't happen, but handle it)
-                symbol_data[symbol]['prev'] = {
-                    'pct': current_pct,
-                    'vol': current_vol,
-                    'open': open_price,
-                    'close': close_price,
-                    'time': minute_ts
-                }
-        else:
-            # First observation for this symbol - store as both first and prev
-            if should_alert(current_pct, current_vol):
-                spike = True
-                message = (
-                    f"🚨 FIRST SPIKE: {symbol}\n"
-                    f"Data: {current_pct:+.2f}% ({current_vol:,})\n"
-                    f"Open: ${open_price:.2f} → Close: ${close_price:.2f}"
-                )
-            
-            # Store first occurrence (baseline) with prices and current as prev
-            symbol_data[symbol] = {
-                'first': {
-                    'pct': current_pct,
-                    'vol': current_vol,
-                    'open': open_price,
-                    'close': close_price,
-                    'time': minute_ts
-                },
-                'prev': {
-                    'pct': current_pct,
-                    'vol': current_vol,
-                    'open': open_price,
-                    'close': close_price,
-                    'time': minute_ts
-                }
-            }
-    
-    # Send alert if spike detected and not in cooldown
-    if spike and can_send_alert(symbol, minute_ts):
-        if send_telegram(message):
-            mark_alerted(symbol, minute_ts)
-            print(f"✓ Alert sent: {symbol}")
+    # Check if current minute meets alert criteria
+    if should_alert(current_pct, current_vol):
+        message = (
+            f"🚨 SPIKE: {symbol} @ {minute_ts.strftime('%H:%M')}\n"
+            f"Open: ${open_price:.2f} → Close: ${close_price:.2f}\n"
+            f"Change: {current_pct:+.2f}%\n"
+            f"Volume: {current_vol:,}"
+        )
+        
+        # Send alert if not in cooldown
+        if can_send_alert(symbol, minute_ts):
+            if send_telegram(message):
+                mark_alerted(symbol, minute_ts)
+                print(f"✓ Alert sent: {symbol} ({current_pct:+.2f}%, {current_vol:,})")
 
 def update_aggregates(symbol, price, size, timestamp):
     """Update minute-level aggregates"""
@@ -353,17 +226,10 @@ def update_aggregates(symbol, price, size, timestamp):
         agg['value'] += price * size
         agg['count'] += 1
         
-        # Calculate percentage change from baseline (first occurrence open price)
-        # If no baseline yet, use minute's own open price
-        base_price = None
-        if symbol in symbol_data and 'first' in symbol_data[symbol]:
-            base_price = symbol_data[symbol]['first']['open']
-        else:
-            base_price = agg['open']
-        
+        # Calculate percentage change within the current minute (open to close)
         pct_change = 0
-        if base_price and base_price > 0:
-            pct_change = ((agg['close'] - base_price) / base_price) * 100
+        if agg['open'] and agg['open'] > 0:
+            pct_change = ((agg['close'] - agg['open']) / agg['open']) * 100
         
         return minute_ts, agg['volume'], pct_change, agg['open'], agg['close']
 
