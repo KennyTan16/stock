@@ -83,7 +83,7 @@ MASSIVE_BUCKET = "flatfiles"
 USE_CACHED_ONLY = True  # User indicated data already stored locally
 
 # Store historical data in organized folder structure
-CACHE_DIR = Path("../historical_data/polygon_flatfiles")
+CACHE_DIR = Path("../historical_data/polygon_flatfiles_minute")
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
 class BacktestResult:
@@ -348,13 +348,14 @@ def backtest_symbol(symbol, bars, result):
     if symbol in momentum_flags:
         del momentum_flags[symbol]
     if symbol in rolling_volume_3min:
-        rolling_volume_3min[symbol] = []
+        del rolling_volume_3min[symbol]
+    # Initialize with [0, 0, 0] as expected by check_spike
+    rolling_volume_3min[symbol] = [0, 0, 0]
     if symbol in minute_aggregates:
         del minute_aggregates[symbol]
     if symbol in latest_quotes:
         del latest_quotes[symbol]
     
-    processed_watch_indices = set()
     for i, bar in enumerate(bars):
         result.bars_processed += 1
         
@@ -374,10 +375,12 @@ def backtest_symbol(symbol, bars, result):
         
         # Update rolling 3-minute volume
         if symbol not in rolling_volume_3min:
-            rolling_volume_3min[symbol] = []
-        if len(rolling_volume_3min[symbol]) >= 3:
-            rolling_volume_3min[symbol].pop(0)
-        rolling_volume_3min[symbol].append(bar['volume'])
+            rolling_volume_3min[symbol] = [0, 0, 0]
+        
+        # Shift the rolling window (keep last 3 minutes)
+        rolling_volume_3min[symbol][0] = rolling_volume_3min[symbol][1]
+        rolling_volume_3min[symbol][1] = rolling_volume_3min[symbol][2]
+        rolling_volume_3min[symbol][2] = bar['volume']
         
         # Calculate percentage change
         pct_change = ((bar['close'] - bar['open']) / bar['open']) * 100 if bar['open'] > 0 else 0
@@ -390,12 +393,8 @@ def backtest_symbol(symbol, bars, result):
             'timestamp': bar['timestamp']
         }
         
-        # Track if flag exists before check
-        flag_before = symbol in momentum_flags
-        flag_data_before = momentum_flags.get(symbol, {})
-        
-        # Run check_spike
-        check_spike(
+        # Run check_spike and capture any returned alert
+        alert_data = check_spike(
             symbol=symbol,
             current_pct=pct_change,
             current_vol=bar['volume'],
@@ -405,92 +404,31 @@ def backtest_symbol(symbol, bars, result):
             trade_count=bar['transactions'],
             vwap=bar['vwap']
         )
-
-        # Capture any new Stage 0 watch alerts emitted in this minute for this symbol
-        for idx, wa in enumerate(watch_alerts):
-            if idx in processed_watch_indices:
-                continue
-            if wa['symbol'] != symbol:
-                continue
-            # Only consider alerts at or before current minute timestamp
-            if hasattr(wa['timestamp'], 'isoformat'):
-                wa_minute = wa['timestamp']
-            else:
-                wa_minute = datetime.fromtimestamp(wa['timestamp'], tz=ET_TIMEZONE)
-            if wa_minute == minute_ts:
-                # Record watch alert (no trade outcome simulation for watch tier)
-                alert_data = {
-                    'symbol': symbol,
-                    'timestamp': wa_minute.isoformat(),
-                    'stage': 0,
-                    'entry_price': bar['close'],
-                    'volume': bar['volume'],
-                    'pct_change': pct_change,
-                    'vwap': bar['vwap'],
-                    'quality_score': wa.get('quality')
-                }
-                result.add_alert(alert_data)
-                processed_watch_indices.add(idx)
         
-        # Track if flag exists after check
-        flag_after = symbol in momentum_flags
-        flag_data_after = momentum_flags.get(symbol, {})
-        
-        # Detect if alert was triggered
-        alert_triggered = False
-        alert_stage = 0
-        
-        # Stage 1: Flag created (SETUP flag appears)
-        if not flag_before and flag_after:
-            if flag_data_after.get('flag', '').startswith('SETUP_'):
-                alert_triggered = True
-                alert_stage = 1
-                current_quality = flag_data_after.get('quality_score')
-        
-        # Stage 2: Flag transitioned to CONFIRMED or removed (alert sent)
-        elif flag_before and not flag_after:
-            # Alert was triggered and flag cleared (Stage 2 confirmation)
-            alert_triggered = True
-            alert_stage = 2
-            current_quality = flag_data_before.get('quality_score')
-        
-        if alert_triggered:
+        # If an alert was generated, record it and simulate trading outcome
+        if alert_data:
             # Get future bars for outcome simulation (next 60 minutes)
             future_bars = bars[i+1:i+61]
             
-            # Inject quality & pct_change into entry bar for dynamic outcome simulation
-            bar_with_quality = dict(bar)
-            bar_with_quality['quality_score'] = current_quality if 'current_quality' in locals() else None
-            bar_with_quality['pct_change'] = pct_change
-            outcome = simulate_trading_outcome(bar_with_quality, future_bars, bar['vwap'])
-            
-            alert_data = {
-                'symbol': symbol,
-                'timestamp': minute_ts.isoformat(),
-                'stage': alert_stage,
-                'entry_price': bar['close'],
-                'volume': bar['volume'],
-                'pct_change': pct_change,
-                'vwap': bar['vwap'],
-                'quality_score': current_quality if 'current_quality' in locals() else None,
-                'outcome': outcome
+            # Create entry bar dict with quality for outcome simulation
+            entry_bar = {
+                'close': bar['close'],
+                'quality_score': alert_data.get('quality_score'),
+                'pct_change': pct_change
             }
             
+            # Simulate trading outcome
+            outcome = simulate_trading_outcome(entry_bar, future_bars, bar['vwap'])
+            
+            # Add outcome to alert data
+            alert_data['outcome'] = outcome
+            alert_data['stage'] = 1  # Enhanced system uses unified stage 1
             result.add_alert(alert_data)
             
             # Log alert
-            session_hour = minute_ts.hour
-            if 4 <= session_hour < 9 or (session_hour == 9 and minute_ts.minute < 30):
-                session = "PREMARKET"
-            elif 9 <= session_hour < 16 or (session_hour == 9 and minute_ts.minute >= 30):
-                session = "REGULAR"
-            elif 16 <= session_hour < 20:
-                session = "POSTMARKET"
-            else:
-                session = "CLOSED"
-            
+            session = alert_data['session']
             outcome_str = f"{outcome['hit'].upper()}: {outcome['profit_pct']:+.2f}% in {outcome['bars_held']} bars"
-            print(f"ALERT: {symbol} {session} Stage{alert_stage} | ${bar['close']:.2f} | Vol={bar['volume']:,} | {pct_change:+.2f}% | {outcome_str}")
+            print(f"ALERT: {symbol} {session} Stage1 | ${bar['close']:.2f} | Vol={bar['volume']:,} | {pct_change:+.2f}% | Q={alert_data['quality_score']:.1f} | {outcome_str}")
 
 
 def load_tickers(csv_path):
