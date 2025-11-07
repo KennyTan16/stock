@@ -73,6 +73,8 @@ rolling_volume_3min = defaultdict(lambda: [0, 0, 0])  # last 3 minutes of volume
 price_history = defaultdict(lambda: [])  # {symbol: [(timestamp, price, volume)]} - last 5 minutes
 # Track momentum persistence across bars
 momentum_counter = {}  # {symbol: count} - consecutive bars meeting momentum criteria
+# Track multi-minute rolling data for sustained momentum analysis
+rolling_data = defaultdict(lambda: [])  # {symbol: [{"time": dt, "price": float, "vol": int}]} - last 5 minutes
 # Track session anchors for context
 alert_tracker = {}  # {symbol: datetime} - last alert time
 data_lock = threading.Lock()
@@ -703,18 +705,49 @@ def check_spike(symbol, current_pct, current_vol, minute_ts, open_price, close_p
     else:
         momentum_counter[symbol] = max(0, momentum_counter.get(symbol, 0) - 1)
 
-    # Require persistence to avoid one-bar noise
-    if momentum_counter[symbol] < min_persistence:
-        return  # too early, not persistent yet
+    # === 3b. Multi-minute momentum analysis (EARLY - before persistence check) ===
+    # Update rolling data (price & volume) - keep last 5 minutes
+    rolling_data[symbol].append({"time": dt, "price": close_price, "vol": current_vol})
+    rolling_data[symbol] = rolling_data[symbol][-5:]
+    
+    # Compute multi-minute sustained momentum
+    sustained_momentum = False
+    cumulative_gain = 0
+    if len(rolling_data[symbol]) >= 3:
+        prices = [x["price"] for x in rolling_data[symbol]]
+        vols = [x["vol"] for x in rolling_data[symbol]]
+        
+        # Cumulative gain from oldest to newest price in window
+        if prices[0] > 0:
+            cumulative_gain = (prices[-1] - prices[0]) / prices[0] * 100
+        
+        # Average volume ratio: recent 3 bars vs earlier bars (if available)
+        recent_vols = vols[-3:]
+        earlier_vols = vols[:-3] if len(vols) > 3 else recent_vols
+        
+        avg_recent = sum(recent_vols) / len(recent_vols)
+        avg_earlier = sum(earlier_vols) / len(earlier_vols) if earlier_vols else avg_recent
+        avg_vol_ratio = avg_recent / max(avg_earlier, 1)
+        
+        # Sustained momentum requires significant cumulative gain + volume acceleration
+        sustained_momentum = cumulative_gain >= 5 and avg_vol_ratio >= 1.5
+        
+    # Check if we can proceed: EITHER persistence met OR sustained momentum detected
+    has_persistence = momentum_counter[symbol] >= min_persistence
+    can_proceed = has_persistence or sustained_momentum
+    
+    # DEBUG: Log decision path
+    if sustained_momentum and not has_persistence:
+        print(f"[DEBUG] {symbol} @ {dt.strftime('%H:%M')} - Bypassing persistence check via sustained momentum")
+    
+    if not can_proceed:
+        return  # Neither persistence nor sustained momentum met
 
     # === 4. VWAP alignment ===
     # Confirm that price is consistently above VWAP across multiple lookback periods
     # This prevents false negatives from one-bar VWAP noise
     vwap_trend = vwap_bias(symbol, n=3)  # Check last 3 bars
     vwap_trend_2bar = vwap_bias(symbol, n=2)  # Check last 2 bars
-    
-    # Require at least one lookback period to NOT be bearish
-    # (both can be bearish = skip, at least one neutral/bullish = proceed)
     if vwap_trend == "bearish" and vwap_trend_2bar == "bearish":
         return  # Price moving opposite VWAP trend consistently
 
@@ -760,6 +793,16 @@ def check_spike(symbol, current_pct, current_vol, minute_ts, open_price, close_p
     )
 
     quality = base_quality * (0.5 + 0.5 * liquidity_score)
+    
+    # Apply sustained momentum bonus (up to +10 points)
+    if sustained_momentum:
+        momentum_bonus = min(cumulative_gain / 10, 1.0) * 10
+        quality += momentum_bonus
+        print(f"[DEBUG] {symbol} - Quality before bonus: {quality - momentum_bonus:.1f} | Bonus: +{momentum_bonus:.1f} | Final: {quality:.1f}")
+
+    # DEBUG: Log quality score for all bars that passed early checks
+    if sustained_momentum or has_persistence:
+        print(f"[DEBUG] {symbol} @ {dt.strftime('%H:%M')} - Quality: {quality:.1f} | Need: 45 for Stage 1")
 
     # === 8. Multi-stage alert system based on quality tiers ===
     # Determine alert stage based on quality score and persistence level
@@ -768,6 +811,10 @@ def check_spike(symbol, current_pct, current_vol, minute_ts, open_price, close_p
         stage = "STAGE 1"
     if quality >= 60:
         stage = "STAGE 2"
+    
+    # DEBUG: Log stage determination
+    if (sustained_momentum or has_persistence) and stage is None:
+        print(f"[DEBUG] {symbol} @ {dt.strftime('%H:%M')} - ❌ Quality {quality:.1f} < 45, no stage assigned")
     
     # No alert if quality/persistence insufficient for any stage
     if stage is None:
