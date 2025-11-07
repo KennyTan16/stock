@@ -683,7 +683,7 @@ def check_spike(symbol, current_pct, current_vol, minute_ts, open_price, close_p
         min_persistence = 1  # Allow 1-bar signals in backtest
     else:
         # Production thresholds - use full dynamic threshold
-        relvol_ok = rel_vol >= 2.0
+        relvol_ok = rel_vol >= 1.75
         pct_ok = current_pct >= pct_thresh_early
         
         # Adaptive persistence based on liquidity
@@ -764,9 +764,9 @@ def check_spike(symbol, current_pct, current_vol, minute_ts, open_price, close_p
     # === 8. Multi-stage alert system based on quality tiers ===
     # Determine alert stage based on quality score and persistence level
     stage = None
-    if quality >= 45 and momentum_counter[symbol] >= 2:
+    if quality >= 45:
         stage = "STAGE 1"
-    if quality >= 60 and momentum_counter[symbol] >= 3:
+    if quality >= 60:
         stage = "STAGE 2"
     
     # No alert if quality/persistence insufficient for any stage
