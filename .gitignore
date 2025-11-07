@@ -1,0 +1,48 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+dist/
+build/
+
+# Virtual Environment
+.venv/
+venv/
+ENV/
+
+# Historical Data (too large for git)
+historical_data/
+polygon_flatfiles/
+
+# Results (generated files)
+results/
+*.json
+backtest_output.txt
+
+# Data files (can be large)
+data/minute_data_*.json
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# Temporary files
+*.tmp
+*.temp
+
+# Sensitive information
+config_local.py
+.env
+credentials.json
