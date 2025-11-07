@@ -185,6 +185,70 @@ def get_minute_ts(timestamp):
             dt = ET_TIMEZONE.localize(dt)
     return dt.replace(second=0, microsecond=0)
 
+def fetch_recent_news(symbol, limit=1):
+    """Fetch recent news for a symbol from Polygon API.
+    Returns a list of news items with title, published time, sentiment, and URL.
+    """
+    try:
+        url = f"https://api.polygon.io/v2/reference/news"
+        params = {
+            'ticker': symbol,
+            'limit': limit,
+            'order': 'desc',
+            'sort': 'published_utc',
+            'apiKey': API_KEY
+        }
+        
+        response = requests.get(url, params=params, timeout=5)
+        
+        if response.status_code == 200:
+            data = response.json()
+            results = data.get('results', [])
+            
+            news_items = []
+            for item in results[:limit]:
+                # Parse published time
+                published = item.get('published_utc', '')
+                if published:
+                    try:
+                        dt = datetime.fromisoformat(published.replace('Z', '+00:00'))
+                        time_ago = (datetime.now(dt.tzinfo) - dt).total_seconds() / 3600
+                        if time_ago < 1:
+                            time_str = f"{int(time_ago * 60)}m ago"
+                        elif time_ago < 24:
+                            time_str = f"{int(time_ago)}h ago"
+                        else:
+                            time_str = f"{int(time_ago / 24)}d ago"
+                    except:
+                        time_str = "recently"
+                else:
+                    time_str = "recently"
+                
+                # Extract sentiment for this specific ticker
+                sentiment = None
+                sentiment_reasoning = None
+                insights = item.get('insights', [])
+                for insight in insights:
+                    if insight.get('ticker') == symbol:
+                        sentiment = insight.get('sentiment', '').capitalize()
+                        sentiment_reasoning = insight.get('sentiment_reasoning', '')
+                        break
+                
+                news_items.append({
+                    'title': item.get('title', 'No title'),
+                    'time': time_str,
+                    'url': item.get('article_url', ''),
+                    'sentiment': sentiment,
+                    'sentiment_reasoning': sentiment_reasoning
+                })
+            
+            return news_items
+        
+    except Exception as e:
+        print(f"News fetch error for {symbol}: {e}")
+    
+    return []
+
 def send_telegram(message):
     """Send Telegram message unless DISABLE_NOTIFICATIONS flag set."""
     if DISABLE_NOTIFICATIONS:
@@ -362,7 +426,22 @@ def get_spread_limit(session):
 def get_recent_prices(symbol, n=3):
     """Get last n closing prices for symbol from minute aggregates."""
     prices = []
-    sorted_minutes = sorted(minute_aggregates.keys(), reverse=True)
+    
+    # Normalize all keys to timezone-aware datetimes for comparison
+    try:
+        normalized_minutes = []
+        for minute_ts in minute_aggregates.keys():
+            if isinstance(minute_ts, datetime):
+                if minute_ts.tzinfo is None:
+                    # Make naive datetime timezone-aware
+                    normalized_minutes.append(ET_TIMEZONE.localize(minute_ts))
+                else:
+                    normalized_minutes.append(minute_ts)
+        
+        sorted_minutes = sorted(normalized_minutes, reverse=True)
+    except Exception:
+        # Fallback: just get last n items without sorting by time
+        sorted_minutes = list(minute_aggregates.keys())[-n:]
     
     for minute_ts in sorted_minutes[:n]:
         agg = minute_aggregates[minute_ts].get(symbol)
@@ -376,7 +455,22 @@ def get_recent_prices(symbol, n=3):
 def get_recent_vwaps(symbol, n=3):
     """Get last n VWAPs for symbol from minute aggregates."""
     vwaps = []
-    sorted_minutes = sorted(minute_aggregates.keys(), reverse=True)
+    
+    # Normalize all keys to timezone-aware datetimes for comparison
+    try:
+        normalized_minutes = []
+        for minute_ts in minute_aggregates.keys():
+            if isinstance(minute_ts, datetime):
+                if minute_ts.tzinfo is None:
+                    # Make naive datetime timezone-aware
+                    normalized_minutes.append(ET_TIMEZONE.localize(minute_ts))
+                else:
+                    normalized_minutes.append(minute_ts)
+        
+        sorted_minutes = sorted(normalized_minutes, reverse=True)
+    except Exception:
+        # Fallback: just get last n items without sorting by time
+        sorted_minutes = list(minute_aggregates.keys())[-n:]
     
     for minute_ts in sorted_minutes[:n]:
         agg = minute_aggregates[minute_ts].get(symbol)
@@ -435,14 +529,14 @@ def load_historical_stats():
     except Exception as e:
         print(f"[WARN] Error loading historical stats: {e}")
 
-def get_average_volume(symbol, days=20):
+def get_average_volume(symbol):
     """Get average daily volume from cached historical data.
     Returns None if not available in cache.
     """
     stats = historical_stats_cache.get(symbol)
     return stats['avg_volume'] if stats else None
 
-def get_average_price_range(symbol, days=20):
+def get_average_price_range(symbol):
     """Get average daily price range (high-low) from cached historical data.
     Returns None if not available in cache.
     """
@@ -539,17 +633,26 @@ def check_spike(symbol, current_pct, current_vol, minute_ts, open_price, close_p
         return  # market closed
 
     # === 2. Compute baseline metrics for adaptive thresholds ===
-    avg_vol_20d = get_average_volume(symbol, days=20)
-    avg_range_20d = get_average_price_range(symbol, days=20)
+    avg_vol_20d = get_average_volume(symbol)
+    avg_range_20d = get_average_price_range(symbol)
     spread_ratio = get_spread_ratio(symbol, fallback_price=price)
     vols = rolling_volume_3min.get(symbol, [0, 0, 0])
     vol_prev5 = sum(vols) / max(len(vols), 1)
     rel_vol = current_vol / max(vol_prev5, 1)
 
     # Dynamic volume threshold scaled by average liquidity
+    # Session-specific multipliers to account for lower volume in extended hours
     # If avg_vol_20d is None (no historical data), fall back to base threshold
     if avg_vol_20d is not None:
-        vol_thresh = max(BASE_VOL_THRESH(session), avg_vol_20d * 0.12)
+        # Adjust multiplier based on session (extended hours trade lighter)
+        if session == "PREMARKET":
+            vol_multiplier = 0.02  # ~2% of daily average for pre-market
+        elif session == "POSTMARKET":
+            vol_multiplier = 0.03  # ~3% of daily average for post-market
+        else:  # REGULAR hours
+            vol_multiplier = 0.12  # ~12% of daily average for regular hours
+        
+        vol_thresh = max(BASE_VOL_THRESH(session), avg_vol_20d * vol_multiplier)
     else:
         vol_thresh = BASE_VOL_THRESH(session)
     
@@ -661,9 +764,9 @@ def check_spike(symbol, current_pct, current_vol, minute_ts, open_price, close_p
     # === 8. Multi-stage alert system based on quality tiers ===
     # Determine alert stage based on quality score and persistence level
     stage = None
-    if quality >= 50 and momentum_counter[symbol] >= 2:
+    if quality >= 45 and momentum_counter[symbol] >= 2:
         stage = "STAGE 1"
-    if quality >= 65 and momentum_counter[symbol] >= 3:
+    if quality >= 60 and momentum_counter[symbol] >= 3:
         stage = "STAGE 2"
     
     # No alert if quality/persistence insufficient for any stage
@@ -682,6 +785,37 @@ def check_spike(symbol, current_pct, current_vol, minute_ts, open_price, close_p
     if can_send_alert(symbol, dt):
         mark_alerted(symbol, dt)
         spread_display = f"{spread_ratio:.3f}" if spread_ratio is not None else "n/a"
+        
+        # Fetch recent news for the symbol
+        news_items = fetch_recent_news(symbol, limit=2)
+        news_text = ""
+        if news_items:
+            news_text = "\n\n📰 Recent News:\n"
+            for item in news_items:
+                # Truncate title if too long
+                title = item['title']
+                if len(title) > 80:
+                    title = title[:77] + "..."
+                
+                # Add sentiment emoji if available
+                sentiment_emoji = ""
+                if item.get('sentiment'):
+                    sentiment_map = {
+                        'Positive': '🟢',
+                        'Negative': '🔴',
+                        'Neutral': '⚪'
+                    }
+                    sentiment_emoji = f" {sentiment_map.get(item['sentiment'], '')}"
+                
+                news_text += f"{sentiment_emoji}{title} ({item['time']})\n"
+                
+                # Add sentiment reasoning if available
+                if item.get('sentiment_reasoning'):
+                    reasoning = item['sentiment_reasoning']
+                    if len(reasoning) > 120:
+                        reasoning = reasoning[:117] + "..."
+                    news_text += f"  💭 {reasoning}\n"
+        
         send_telegram(
             f"🔥 {stage} SPIKE DETECTED ({session})\n"
             f"{symbol} @ ${price:.2f}\n"
@@ -690,6 +824,7 @@ def check_spike(symbol, current_pct, current_vol, minute_ts, open_price, close_p
             f"Spread {spread_display} | Trades {trade_count}\n"
             f"Quality {quality:.1f}/100 | Persistence {momentum_counter[symbol]}\n"
             f"{dt.strftime('%I:%M:%S %p ET')}"
+            f"{news_text}"
         )
         print(f"[{stage}] {symbol} {session} | pct={current_pct:.2f}% | rel_vol={rel_vol:.2f}x | Q={quality:.1f} | persist={momentum_counter[symbol]}")
         
