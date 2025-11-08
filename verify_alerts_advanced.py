@@ -1,5 +1,5 @@
 """
-Command-line tool to verify alerts using the ACTUAL check_spike logic from polygon_websocket.py
+Command-line tool to verify alerts using the ACTUAL check_momentum logic from polygon_websocket.py
 
 Usage:
     python verify_alerts_advanced.py SYMBOL DATE START_TIME END_TIME
@@ -156,7 +156,7 @@ def simulate_detection(symbol, all_bars, target_range_only=False):
         polygon_websocket.update_price_history(symbol, dt, bar['close'], bar['volume'])
         
         # Build momentum state for ALL bars (needed for context)
-        # but only run full check_spike (which prints/alerts) for target range
+        # but only run full check_momentum (which prints/alerts) for target range
         if not bar['in_range']:
             # Just update momentum counter without alerting
             vols = polygon_websocket.rolling_volume_3min.get(symbol, [0, 0, 0])
@@ -182,8 +182,8 @@ def simulate_detection(symbol, all_bars, target_range_only=False):
             
             continue  # Skip to next bar
         
-        # Only call check_spike for bars in target range
-        alert = polygon_websocket.check_spike(
+        # Only call check_momentum for bars in target range
+        alert = polygon_websocket.check_momentum(
             symbol=symbol,
             current_pct=bar['pct'],
             current_vol=bar['volume'],
@@ -202,8 +202,22 @@ def simulate_detection(symbol, all_bars, target_range_only=False):
         
         if alert:
             print(f"  🔥 Stage: {alert['stage']}")
-            print(f"  🔥 Quality: {alert['quality_score']:.1f}/100")
-            print(f"  🔥 RelVol: {alert['rel_vol']:.2f}x")
+            
+            # Stage 1 EARLY alerts have momentum_likelihood, not quality_score
+            if alert['stage'] == 'STAGE 1 EARLY':
+                print(f"  🔥 Momentum Likelihood: {alert['momentum_likelihood']:.3f}")
+                if 'accumulated_momentum' in alert:
+                    print(f"  🔥 Accumulated Momentum: {alert['accumulated_momentum']} bars")
+                print(f"  🔥 RelVol: {alert['rel_vol']:.2f}x")
+            else:
+                # Stage 2 CONFIRMED alerts have quality_score
+                print(f"  🔥 Quality: {alert['quality_score']:.1f}/100")
+                print(f"  🔥 RelVol: {alert['rel_vol']:.2f}x")
+                if 'follow_through' in alert:
+                    print(f"  🔥 Follow-through: {alert['follow_through']:.2f}%")
+                if 'bars_confirmed' in alert:
+                    print(f"  🔥 Bars Confirmed: {alert['bars_confirmed']}")
+            
             alerts.append({**bar, 'alert_data': alert})
     
     return alerts
@@ -216,7 +230,7 @@ def main():
         print("  python verify_alerts_advanced.py RUBI 2025-11-07 08:00 08:15")
         print("  python verify_alerts_advanced.py VSME 2025-11-07 08:00 08:30")
         print("\nNote:")
-        print("  - Uses ACTUAL check_spike logic from polygon_websocket.py")
+        print("  - Uses ACTUAL check_momentum logic from polygon_websocket.py")
         print("  - Simulates full state (persistence, VWAP, momentum)")
         print("  - Times are in ET (Eastern Time)")
         print("  - Use 24-hour format (e.g., 09:30, 14:45)")
@@ -228,7 +242,7 @@ def main():
     end_time = sys.argv[4]
     
     print(f"{'='*80}")
-    print(f"ADVANCED ALERT VERIFICATION (Using Real check_spike Logic)")
+    print(f"ADVANCED ALERT VERIFICATION (Using Real check_momentum Logic)")
     print(f"{'='*80}")
     print(f"Symbol: {symbol}")
     print(f"Date: {date}")
@@ -259,16 +273,28 @@ def main():
             alert_data = alert['alert_data']
             print(f"\n  {alert['time']} - {alert_data['stage']}")
             print(f"    Move: {alert['pct']:+.2f}% | Volume: {alert['volume']:,}")
-            print(f"    Quality: {alert_data['quality_score']:.1f}/100")
-            print(f"    RelVol: {alert_data['rel_vol']:.2f}x")
-            print(f"    VWAP Trend: {alert_data['vwap_trend']}")
-            print(f"    Momentum Bars: {alert_data['momentum_bars']}")
+            
+            if alert_data['stage'] == 'STAGE 1 EARLY':
+                # Stage 1 EARLY alerts
+                print(f"    Momentum Likelihood: {alert_data['momentum_likelihood']:.3f}")
+                if 'accumulated_momentum' in alert_data:
+                    print(f"    Accumulated Momentum: {alert_data['accumulated_momentum']} bars")
+                print(f"    RelVol: {alert_data['rel_vol']:.2f}x")
+            else:
+                # Stage 2 CONFIRMED alerts
+                print(f"    Quality: {alert_data['quality_score']:.1f}/100")
+                print(f"    RelVol: {alert_data['rel_vol']:.2f}x")
+                print(f"    VWAP Trend: {alert_data['vwap_trend']}")
+                if 'follow_through' in alert_data:
+                    print(f"    Follow-through: {alert_data['follow_through']:.2f}%")
+                if 'bars_confirmed' in alert_data:
+                    print(f"    Bars Confirmed: {alert_data['bars_confirmed']}")
     else:
         print(f"\n❌ NO alerts would be triggered")
         print("\nPossible reasons:")
-        print("  • Multi-bar persistence not met (need 1-3 consecutive bars)")
-        print("  • VWAP trend bearish on multiple lookback periods")
-        print("  • Quality score below Stage 1 threshold (45)")
+        print("  • Momentum likelihood below 0.75 threshold")
+        print("  • No positive acceleration in momentum likelihood")
+        print("  • Stage 2 confirmation criteria not met")
         print("  • Volume/percentage below dynamic thresholds")
         print("  • Within 5-minute cooldown from previous alert")
     

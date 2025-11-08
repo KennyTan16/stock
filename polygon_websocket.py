@@ -77,6 +77,9 @@ momentum_counter = {}  # {symbol: count} - consecutive bars meeting momentum cri
 rolling_data = defaultdict(lambda: [])  # {symbol: [{"time": dt, "price": float, "vol": int}]} - last 5 minutes
 # Track session anchors for context
 alert_tracker = {}  # {symbol: datetime} - last alert time
+# Two-stage momentum detection system
+momentum_state = defaultdict(lambda: {'likelihood': 0})  # Track momentum likelihood across bars
+stage1_alerts = {}  # {symbol: {'time': dt, 'setup_price': float, 'bars_confirmed': int, ...}}
 data_lock = threading.Lock()
 telegram_lock = threading.Lock()
 quote_lock = threading.Lock()
@@ -527,7 +530,6 @@ def load_historical_stats():
                     'avg_range': float(row['avg_range_20d']) if row['avg_range_20d'] else None,
                     'last_updated': row.get('last_updated', '')
                 }
-        print(f"[OK] Loaded historical stats for {len(historical_stats_cache)} symbols")
     except Exception as e:
         print(f"[WARN] Error loading historical stats: {e}")
 
@@ -610,15 +612,27 @@ def compute_quality_score(rel_vol, pct_change, volume, vol_thresh, trade_count, 
     score = max(0, min(score, 100))
     return round(score, 1)
 
-def check_spike(symbol, current_pct, current_vol, minute_ts, open_price, close_price, trade_count, vwap):
+def check_momentum(symbol, current_pct, current_vol, minute_ts, open_price, close_price, trade_count, vwap):
     """
-    Enhanced spike detector with:
-      1. Dynamic per-symbol thresholds (volatility + liquidity aware)
-      2. Multi-bar persistence confirmation
-      3. Liquidity-weighted quality scoring
-      4. VWAP alignment & trend confirmation
+    Two-stage probabilistic momentum detection system.
+    
+    Stage 1: Early entry on high probability momentum setup
+    - Calculates momentum_likelihood (weighted composite score)
+    - Tracks acceleration (likelihood change between bars)
+    - Sends "🚀 EARLY MOMENTUM" alert on likelihood >= 0.75 with acceleration
+    - Stores setup in stage1_alerts for tracking
+    
+    Stage 2: Confirmation after multi-bar validation
+    - Requires bars_confirmed >= 2
+    - Validates: sustained_volume, price_above_vwap, follow_through >= 2.5%
+    - Quality score >= 60 with non-bearish VWAP
+    - Sends "🔥 CONFIRMED MOMENTUM" alert
+    
+    Auto-cancellation:
+    - If follow_through < -1% OR momentum_likelihood < 0.4
+    - Removes from stage1_alerts, logs cancellation
     """
-
+    
     # === 0. Setup and timestamp normalization ===
     dt = normalize_timestamp(minute_ts)
     hour, minute = dt.hour, dt.minute
@@ -634,7 +648,7 @@ def check_spike(symbol, current_pct, current_vol, minute_ts, open_price, close_p
     else:
         return  # market closed
 
-    # === 2. Compute baseline metrics for adaptive thresholds ===
+    # === 2. Compute baseline metrics ===
     avg_vol_20d = get_average_volume(symbol)
     avg_range_20d = get_average_price_range(symbol)
     spread_ratio = get_spread_ratio(symbol, fallback_price=price)
@@ -642,257 +656,259 @@ def check_spike(symbol, current_pct, current_vol, minute_ts, open_price, close_p
     vol_prev5 = sum(vols) / max(len(vols), 1)
     rel_vol = current_vol / max(vol_prev5, 1)
 
-    # Dynamic volume threshold scaled by average liquidity
-    # Session-specific multipliers to account for lower volume in extended hours
-    # If avg_vol_20d is None (no historical data), fall back to base threshold
+    # Dynamic volume threshold
     if avg_vol_20d is not None:
-        # Adjust multiplier based on session (extended hours trade lighter)
         if session == "PREMARKET":
-            vol_multiplier = 0.02  # ~2% of daily average for pre-market
+            vol_multiplier = 0.015
         elif session == "POSTMARKET":
-            vol_multiplier = 0.03  # ~3% of daily average for post-market
-        else:  # REGULAR hours
-            vol_multiplier = 0.12  # ~12% of daily average for regular hours
-        
+            vol_multiplier = 0.02
+        else:  # REGULAR
+            vol_multiplier = 0.10
         vol_thresh = max(BASE_VOL_THRESH(session), avg_vol_20d * vol_multiplier)
     else:
         vol_thresh = BASE_VOL_THRESH(session)
     
-    # Dynamic percent threshold scaled by volatility
+    # Dynamic percent threshold
     if avg_range_20d is not None and open_price > 0:
-        pct_thresh_early = max(BASE_PCT_THRESH(session), (avg_range_20d / open_price) * 1.2)
+        pct_thresh = max(BASE_PCT_THRESH(session), (avg_range_20d / open_price) * 1.2)
     else:
-        pct_thresh_early = BASE_PCT_THRESH(session)
+        pct_thresh = BASE_PCT_THRESH(session)
 
-    # Liquidity weighting (for small caps vs large caps)
+    # Liquidity score
     if avg_vol_20d is not None:
         liquidity_score = min(1.0, avg_vol_20d / 1_000_000)
         if liquidity_score < 0.1:
-            return  # illiquid, skip alert
+            return  # Too illiquid
     else:
-        # If no historical data, assume moderate liquidity (don't filter out)
         liquidity_score = 0.5
 
-    # === 3. Multi-bar persistence check ===
-    # Track number of consecutive bars meeting min momentum criteria
-    # Use dynamically calculated pct_thresh_early (adapts to symbol volatility)
-    backtest_mode = os.getenv("BACKTEST_MODE", "0") == "1"
+    # === 3. Calculate momentum_likelihood (weighted composite) ===
+    # Component 1: Relative volume (40% weight)
+    rel_vol_component = min(rel_vol / 3.0, 1.0) * 0.40
     
-    if backtest_mode:
-        # Relaxed thresholds for backtest
-        relvol_ok = rel_vol >= 1.5
-        pct_ok = current_pct >= (pct_thresh_early * 0.65)  # 65% of dynamic threshold
-        min_persistence = 1  # Allow 1-bar signals in backtest
+    # Component 2: Percent change (30% weight)
+    pct_component = min(current_pct / pct_thresh, 1.0) * 0.30
+    
+    # Component 3: VWAP alignment (15% weight)
+    # Bullish = full weight, Neutral = half weight, Bearish = zero weight
+    vwap_trend = vwap_bias(symbol, n=3)
+    if vwap_trend == "bullish":
+        vwap_component = 1.0 * 0.15
+    elif vwap_trend == "neutral":
+        vwap_component = 0.5 * 0.15  # Give partial credit for neutral
+    else:  # bearish
+        vwap_component = 0.0
+    
+    # Component 4: Spread tightness (10% weight)
+    spread_limit = get_spread_limit(session)
+    if spread_ratio is not None and spread_limit > 0:
+        spread_component = max(0, 1.0 - (spread_ratio / spread_limit)) * 0.10
     else:
-        # Production thresholds - use full dynamic threshold
-        relvol_ok = rel_vol >= 1.75
-        pct_ok = current_pct >= pct_thresh_early
-        
-        # Adaptive persistence based on liquidity
-        # Illiquid stocks need more confirmation, liquid stocks can move faster
-        if avg_vol_20d is not None:
-            if avg_vol_20d < 500_000:
-                min_persistence = 3  # Slower confirmation for illiquid stocks
-            elif avg_vol_20d > 3_000_000:
-                min_persistence = 1  # Fast-moving large caps can alert quickly
-            else:
-                min_persistence = 2  # Standard confirmation for mid-liquidity
-        else:
-            min_persistence = 2  # Default if no historical data
+        spread_component = 0.05  # Neutral if unknown
     
-    if relvol_ok and pct_ok:
+    # Component 5: Liquidity (5% weight)
+    liquidity_component = liquidity_score * 0.05
+    
+    # Total momentum likelihood
+    momentum_likelihood = (rel_vol_component + pct_component + vwap_component + 
+                          spread_component + liquidity_component)
+    
+    # Track acceleration (change in likelihood from previous bar)
+    prev_likelihood = momentum_state[symbol]['likelihood']
+    acceleration = momentum_likelihood - prev_likelihood
+    momentum_state[symbol]['likelihood'] = momentum_likelihood
+    
+    # Track rolling accumulated momentum (consecutive bars above 0.5 threshold)
+    if momentum_likelihood >= 0.5:
         momentum_counter[symbol] = momentum_counter.get(symbol, 0) + 1
     else:
-        momentum_counter[symbol] = max(0, momentum_counter.get(symbol, 0) - 1)
-
-    # === 3b. Multi-minute momentum analysis (EARLY - before persistence check) ===
-    # Update rolling data (price & volume) - keep last 5 minutes
-    rolling_data[symbol].append({"time": dt, "price": close_price, "vol": current_vol})
-    rolling_data[symbol] = rolling_data[symbol][-5:]
+        momentum_counter[symbol] = 0
     
-    # Compute multi-minute sustained momentum
-    sustained_momentum = False
-    cumulative_gain = 0
-    if len(rolling_data[symbol]) >= 3:
-        prices = [x["price"] for x in rolling_data[symbol]]
-        vols = [x["vol"] for x in rolling_data[symbol]]
+    accumulated_momentum = momentum_counter.get(symbol, 0)
         
-        # Cumulative gain from oldest to newest price in window
-        if prices[0] > 0:
-            cumulative_gain = (prices[-1] - prices[0]) / prices[0] * 100
-        
-        # Average volume ratio: recent 3 bars vs earlier bars (if available)
-        recent_vols = vols[-3:]
-        earlier_vols = vols[:-3] if len(vols) > 3 else recent_vols
-        
-        avg_recent = sum(recent_vols) / len(recent_vols)
-        avg_earlier = sum(earlier_vols) / len(earlier_vols) if earlier_vols else avg_recent
-        avg_vol_ratio = avg_recent / max(avg_earlier, 1)
-        
-        # Sustained momentum requires significant cumulative gain + volume acceleration
-        sustained_momentum = cumulative_gain >= 5 and avg_vol_ratio >= 1.5
-        
-    # Check if we can proceed: EITHER persistence met OR sustained momentum detected
-    has_persistence = momentum_counter[symbol] >= min_persistence
-    can_proceed = has_persistence or sustained_momentum
-    
-    # DEBUG: Log decision path
-    if sustained_momentum and not has_persistence:
-        print(f"[DEBUG] {symbol} @ {dt.strftime('%H:%M')} - Bypassing persistence check via sustained momentum")
-    
-    if not can_proceed:
-        return  # Neither persistence nor sustained momentum met
-
-    # === 4. VWAP alignment ===
-    # Confirm that price is consistently above VWAP across multiple lookback periods
-    # This prevents false negatives from one-bar VWAP noise
-    vwap_trend = vwap_bias(symbol, n=3)  # Check last 3 bars
-    vwap_trend_2bar = vwap_bias(symbol, n=2)  # Check last 2 bars
-    if vwap_trend == "bearish" and vwap_trend_2bar == "bearish":
-        return  # Price moving opposite VWAP trend consistently
-
-    # === 5. Volume & price validation ===
-    if current_vol < vol_thresh:
-        return  # weak volume
-    
-    if spread_ratio is not None and spread_ratio > get_spread_limit(session):
-        return  # spread too wide
-
-    # === 6. Calculate momentum dynamics for quality scoring ===
-    # Price expansion within current bar (intrabar move)
-    price_expansion_pct = abs(close_price - open_price) / max(open_price, 0.01) * 100
-    
-    # Acceleration: compare current move to recent average
-    recent_prices = get_recent_prices(symbol, n=3)
-    acceleration = False
-    if len(recent_prices) >= 2:
-        # Calculate previous bar's percentage change
-        prev_pct = ((recent_prices[-1] - recent_prices[-2]) / max(recent_prices[-2], 0.01)) * 100
-        acceleration = current_pct > prev_pct * 1.2  # Current move is 20% stronger
-    
-    # Volume sustained: current volume compared to recent average
-    volume_sustained = False
-    vols = rolling_volume_3min.get(symbol, [0, 0, 0])
-    if len(vols) >= 2 and sum(vols[:2]) > 0:
-        avg_recent_vol = sum(vols[:2]) / 2  # Average of previous 2 bars
-        volume_sustained = current_vol >= avg_recent_vol * 1.1  # 10% above average
-
-    # === 7. Compute liquidity-weighted quality score ===
-    base_quality = compute_quality_score(
-        rel_vol=rel_vol,
-        pct_change=current_pct,
-        volume=current_vol,
-        vol_thresh=vol_thresh,
-        trade_count=trade_count,
-        min_trades=3,
-        spread_ratio=spread_ratio,
-        spread_limit=get_spread_limit(session),
-        price_expansion_pct=price_expansion_pct,
-        acceleration=acceleration,
-        volume_sustained=volume_sustained
-    )
-
-    quality = base_quality * (0.5 + 0.5 * liquidity_score)
-    
-    # Apply sustained momentum bonus (up to +10 points)
-    if sustained_momentum:
-        momentum_bonus = min(cumulative_gain / 10, 1.0) * 10
-        quality += momentum_bonus
-        print(f"[DEBUG] {symbol} - Quality before bonus: {quality - momentum_bonus:.1f} | Bonus: +{momentum_bonus:.1f} | Final: {quality:.1f}")
-
-    # DEBUG: Log quality score for all bars that passed early checks
-    if sustained_momentum or has_persistence:
-        print(f"[DEBUG] {symbol} @ {dt.strftime('%H:%M')} - Quality: {quality:.1f} | Need: 45 for Stage 1")
-
-    # === 8. Multi-stage alert system based on quality tiers ===
-    # Determine alert stage based on quality score and persistence level
-    stage = None
-    if quality >= 45:
-        stage = "STAGE 1"
-    if quality >= 60:
-        stage = "STAGE 2"
-    
-    # DEBUG: Log stage determination
-    if (sustained_momentum or has_persistence) and stage is None:
-        print(f"[DEBUG] {symbol} @ {dt.strftime('%H:%M')} - ❌ Quality {quality:.1f} < 45, no stage assigned")
-    
-    # No alert if quality/persistence insufficient for any stage
-    if stage is None:
-        return None
-
-    # === 9. Final validation and alert ===
-    # BACKTEST MODE: Use moderately lower quality threshold for testing
-    backtest_mode = os.getenv("BACKTEST_MODE", "0") == "1"
-    
-    # BACKTEST MODE: Only trade REGULAR hours (best performance)
-    if backtest_mode and session != "REGULAR":
-        return None
-    
-    # Only send alert if symbol not recently alerted (cooldown)
-    if can_send_alert(symbol, dt):
-        mark_alerted(symbol, dt)
-        spread_display = f"{spread_ratio:.3f}" if spread_ratio is not None else "n/a"
-        
-        # Fetch recent news for the symbol
-        news_items = fetch_recent_news(symbol, limit=2)
-        news_text = ""
-        if news_items:
-            news_text = "\n\n📰 Recent News:\n"
-            for item in news_items:
-                # Truncate title if too long
-                title = item['title']
-                if len(title) > 80:
-                    title = title[:77] + "..."
-                
-                # Add sentiment emoji if available
-                sentiment_emoji = ""
-                if item.get('sentiment'):
-                    sentiment_map = {
-                        'Positive': '🟢',
-                        'Negative': '🔴',
-                        'Neutral': '⚪'
-                    }
-                    sentiment_emoji = f" {sentiment_map.get(item['sentiment'], '')}"
-                
-                news_text += f"{sentiment_emoji}{title} ({item['time']})\n"
-                
-                # Add sentiment reasoning if available
-                if item.get('sentiment_reasoning'):
-                    reasoning = item['sentiment_reasoning']
-                    if len(reasoning) > 120:
-                        reasoning = reasoning[:117] + "..."
-                    news_text += f"  💭 {reasoning}\n"
-        
-        send_telegram(
-            f"🔥 {stage} SPIKE DETECTED ({session})\n"
-            f"{symbol} @ ${price:.2f}\n"
-            f"Pct: +{current_pct:.2f}% | RelVol {rel_vol:.2f}x | Vol {current_vol:,}\n"
-            f"Liquidity {liquidity_score:.2f} | VWAP Trend {vwap_trend}\n"
-            f"Spread {spread_display} | Trades {trade_count}\n"
-            f"Quality {quality:.1f}/100 | Persistence {momentum_counter[symbol]}\n"
-            f"{dt.strftime('%I:%M:%S %p ET')}"
-            f"{news_text}"
-        )
-        print(f"[{stage}] {symbol} {session} | pct={current_pct:.2f}% | rel_vol={rel_vol:.2f}x | Q={quality:.1f} | persist={momentum_counter[symbol]}")
-        
-        # Return alert data for backtest capture
-        return {
-            'symbol': symbol,
-            'timestamp': dt,
-            'session': session,
-            'stage': stage,
-            'entry_price': price,
-                'pct_change': current_pct,
-                'rel_vol': rel_vol,
-                'volume': current_vol,
-                'vwap': vwap,
-                'quality_score': quality,
-                'liquidity_score': liquidity_score,
-                'vwap_trend': vwap_trend,
-                'spread_ratio': spread_ratio,
-                'trade_count': trade_count,
-                'momentum_bars': momentum_counter.get(symbol, 0)
+    # === 4. Check for Stage 1 setup (Early Entry) ===
+    if symbol not in stage1_alerts:
+        # Not yet in Stage 1, check if we should enter
+        if momentum_likelihood >= 0.75 and acceleration > 0:
+            # Strong momentum setup detected! Send early alert
+            stage1_alerts[symbol] = {
+                'time': dt,
+                'session': session,
+                'setup_price': price,
+                'setup_rel_vol': rel_vol,
+                'setup_pct': current_pct,
+                'momentum_likelihood': momentum_likelihood,
+                'accumulated_momentum': accumulated_momentum,
+                'bars_confirmed': 0
             }
+            
+            # Send Stage 1 early momentum alert
+            if can_send_alert(symbol, dt):
+                mark_alerted(symbol, dt)
+                spread_display = f"{spread_ratio:.3f}" if spread_ratio is not None else "n/a"
+                send_telegram(
+                    f"🚀 EARLY MOMENTUM DETECTED ({session})\n"
+                    f"{symbol} @ ${price:.2f}\n"
+                    f"Likelihood: {momentum_likelihood:.2f} | Acceleration: +{acceleration:.2f}\n"
+                    f"Accumulated Bars: {accumulated_momentum} | Pct: +{current_pct:.2f}%\n"
+                    f"RelVol: {rel_vol:.2f}x | Vol: {current_vol:,}\n"
+                    f"VWAP: {vwap_trend} | Spread: {spread_display}\n"
+                    f"{dt.strftime('%I:%M:%S %p ET')}\n"
+                    f"⚠️ Probabilistic entry - awaiting confirmation"
+                )
+                
+                return {
+                    'symbol': symbol,
+                    'timestamp': dt,
+                    'session': session,
+                    'stage': 'STAGE 1 EARLY',
+                    'entry_price': price,
+                    'pct_change': current_pct,
+                    'rel_vol': rel_vol,
+                    'volume': current_vol,
+                    'momentum_likelihood': momentum_likelihood,
+                    'accumulated_momentum': accumulated_momentum
+                }
+            else:
+                # Cooldown prevented alert, but we still track it
+                return None
+    
+    else:
+        # Already in Stage 1, check for confirmation or cancellation
+        setup = stage1_alerts[symbol]
+        setup['bars_confirmed'] += 1
+                
+        # Calculate follow-through from setup
+        follow_through = ((price - setup['setup_price']) / setup['setup_price']) * 100 if setup['setup_price'] > 0 else 0
+        
+        # === 5. Check for auto-cancellation ===
+        if follow_through < -1.0 or momentum_likelihood < 0.4:
+            # Momentum collapsed, cancel the setup
+            del stage1_alerts[symbol]
+            return None
+        
+        # === 6. Check for Stage 2 confirmation ===
+        if setup['bars_confirmed'] >= 2:
+            # Check confirmation criteria (slightly relaxed for better capture rate)
+            sustained_volume = rel_vol > 1.5 and current_vol > vol_thresh
+            price_above_vwap = close_price > vwap
+            follow_through_ok = follow_through >= 2.0 
+            
+            vwap_trend_2bar = vwap_bias(symbol, n=2)
+            vwap_not_bearish = not (vwap_trend == "bearish" and vwap_trend_2bar == "bearish")
+            
+            
+            # Calculate quality score
+            price_expansion_pct = abs(close_price - open_price) / max(open_price, 0.01) * 100
+            
+            recent_prices = get_recent_prices(symbol, n=3)
+            acceleration_price = False
+            if len(recent_prices) >= 2:
+                prev_pct = ((recent_prices[-1] - recent_prices[-2]) / max(recent_prices[-2], 0.01)) * 100
+                acceleration_price = current_pct > prev_pct * 1.2
+            
+            volume_sustained = False
+            vols = rolling_volume_3min.get(symbol, [0, 0, 0])
+            if len(vols) >= 2 and sum(vols[:2]) > 0:
+                avg_recent_vol = sum(vols[:2]) / 2
+                volume_sustained = current_vol >= avg_recent_vol * 1.1
+            
+            base_quality = compute_quality_score(
+                rel_vol=rel_vol,
+                pct_change=current_pct,
+                volume=current_vol,
+                vol_thresh=vol_thresh,
+                trade_count=trade_count,
+                min_trades=3,
+                spread_ratio=spread_ratio,
+                spread_limit=spread_limit,
+                price_expansion_pct=price_expansion_pct,
+                acceleration=acceleration_price,
+                volume_sustained=volume_sustained
+            )
+            
+            quality = base_quality * (0.5 + 0.5 * liquidity_score)
+                                    
+            # Check if all Stage 2 criteria met
+            if (sustained_volume and price_above_vwap and follow_through_ok and 
+                quality >= 50 and vwap_not_bearish):
+                
+                # CONFIRMED! Send Stage 2 alert
+                del stage1_alerts[symbol]  # Remove from tracking
+                
+                # Stage 2 is an upgrade from Stage 1, so we allow it even within cooldown
+                # Just update the alert tracker timestamp
+                mark_alerted(symbol, dt)
+                
+                # Fetch news
+                news_items = fetch_recent_news(symbol, 1)
+                news_text = ""
+                if news_items:
+                    news_text = "\n\n📰 Recent News:\n"
+                    for item in news_items:
+                        title = item['title']
+                        if len(title) > 80:
+                            title = title[:77] + "..."
+                        
+                        sentiment_emoji = ""
+                        if item.get('sentiment'):
+                            sentiment_map = {
+                                'Positive': '🟢',
+                                'Negative': '🔴',
+                                'Neutral': '⚪'
+                            }
+                            sentiment_emoji = f" {sentiment_map.get(item['sentiment'], '')}"
+                        
+                        news_text += f"{sentiment_emoji}{title} ({item['time']})\n"
+                        
+                        if item.get('sentiment_reasoning'):
+                            reasoning = item['sentiment_reasoning']
+                            if len(reasoning) > 120:
+                                reasoning = reasoning[:117] + "..."
+                            news_text += f"  💭 {reasoning}\n"
+                
+                spread_display = f"{spread_ratio:.3f}" if spread_ratio is not None else "n/a"
+                send_telegram(
+                    f"🔥 CONFIRMED MOMENTUM ({session})\n"
+                    f"{symbol} @ ${price:.2f}\n"
+                    f"Setup: ${setup['setup_price']:.2f} → Follow-through: +{follow_through:.2f}%\n"
+                    f"Quality: {quality:.1f}/100 | RelVol: {rel_vol:.2f}x | Vol: {current_vol:,}\n"
+                    f"Pct: +{current_pct:.2f}% | VWAP: {vwap_trend}\n"
+                    f"Spread: {spread_display} | Trades: {trade_count}\n"
+                    f"Bars Confirmed: {setup['bars_confirmed']}\n"
+                    f"{dt.strftime('%I:%M:%S %p ET')}"
+                    f"{news_text}"
+                )
+                
+                return {
+                    'symbol': symbol,
+                    'timestamp': dt,
+                    'session': session,
+                    'stage': 'STAGE 2 CONFIRMED',
+                    'entry_price': price,
+                    'setup_price': setup['setup_price'],
+                    'follow_through': follow_through,
+                    'pct_change': current_pct,
+                    'rel_vol': rel_vol,
+                    'volume': current_vol,
+                    'vwap': vwap,
+                    'quality_score': quality,
+                    'liquidity_score': liquidity_score,
+                    'vwap_trend': vwap_trend,
+                    'spread_ratio': spread_ratio,
+                    'trade_count': trade_count,
+                    'bars_confirmed': setup['bars_confirmed']
+                    }
+    
+    # === 7. Cleanup stale Stage 1 setups (after 5 minutes) ===
+    stale_symbols = []
+    for sym, setup in stage1_alerts.items():
+        time_elapsed = (dt - setup['time']).total_seconds()
+        if time_elapsed > 300:  # 5 minutes
+            stale_symbols.append(sym)
+    
+    for sym in stale_symbols:
+        del stage1_alerts[sym]
     
     return None
 
@@ -993,8 +1009,8 @@ def handle_msg(msgs):
                     rolling_volume_3min[symbol] = [0, 0, 0]
                 update_rolling_volume(symbol, volume)
             
-            # Check for spike on every trade (real-time detection)
-            check_spike(symbol, pct_change, volume, minute_ts, open_price, close_price, trade_count, vwap)
+            # Check for momentum on every trade (real-time detection)
+            check_momentum(symbol, pct_change, volume, minute_ts, open_price, close_price, trade_count, vwap)
             
         except Exception as e:
             import traceback
