@@ -134,9 +134,7 @@ def is_active_trading_session():
 def get_next_premarket():
     """Get next pre-market start time"""
     now = get_et_time()
-    today_start = ET_TIMEZONE.localize(
-        datetime.combine(now.date(), datetime.strptime(PRE_MARKET_START, "%H:%M").time())
-    )
+    today_start = datetime.combine(now.date(), datetime.strptime(PRE_MARKET_START, "%H:%M").time()).replace(tzinfo=ET_TIMEZONE)
     
     if now < today_start and now.weekday() < 5:
         return today_start
@@ -146,9 +144,7 @@ def get_next_premarket():
     while next_day.weekday() >= 5:
         next_day += timedelta(days=1)
     
-    return ET_TIMEZONE.localize(
-        datetime.combine(next_day, datetime.strptime(PRE_MARKET_START, "%H:%M").time())
-    )
+    return datetime.combine(next_day, datetime.strptime(PRE_MARKET_START, "%H:%M").time()).replace(tzinfo=ET_TIMEZONE)
 
 def read_tickers(filepath):
     """Read ticker symbols from CSV with fallback to legacy path."""
@@ -187,7 +183,7 @@ def get_minute_ts(timestamp):
         dt = timestamp
         # If dt is naive, make it timezone-aware in ET
         if dt.tzinfo is None:
-            dt = ET_TIMEZONE.localize(dt)
+            dt = dt.replace(tzinfo=ET_TIMEZONE)
     return dt.replace(second=0, microsecond=0)
 
 def fetch_recent_news(symbol, limit=1):
@@ -439,7 +435,7 @@ def get_recent_prices(symbol, n=3):
             if isinstance(minute_ts, datetime):
                 if minute_ts.tzinfo is None:
                     # Make naive datetime timezone-aware
-                    normalized_minutes.append(ET_TIMEZONE.localize(minute_ts))
+                    normalized_minutes.append(minute_ts.replace(tzinfo=ET_TIMEZONE))
                 else:
                     normalized_minutes.append(minute_ts)
         
@@ -468,7 +464,7 @@ def get_recent_vwaps(symbol, n=3):
             if isinstance(minute_ts, datetime):
                 if minute_ts.tzinfo is None:
                     # Make naive datetime timezone-aware
-                    normalized_minutes.append(ET_TIMEZONE.localize(minute_ts))
+                    normalized_minutes.append(minute_ts.replace(tzinfo=ET_TIMEZONE))
                 else:
                     normalized_minutes.append(minute_ts)
         
@@ -677,8 +673,6 @@ def check_momentum(symbol, current_pct, current_vol, minute_ts, open_price, clos
     # Liquidity score
     if avg_vol_20d is not None:
         liquidity_score = min(1.0, avg_vol_20d / 1_000_000)
-        if liquidity_score < 0.1:
-            return  # Too illiquid
     else:
         liquidity_score = 0.5
 
