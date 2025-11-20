@@ -47,7 +47,8 @@ DISABLE_NOTIFICATIONS = os.getenv("DISABLE_NOTIFICATIONS", "0") == "1"  # Set en
 STAGE2_DEBUG = os.getenv("STAGE2_DEBUG", "0") == "1"  # Enable detailed Stage 2 diagnostic logging
 API_KEY = "3z93jv2EOJ9d7KrEbdnXzCaBfUQJBBoW"
 TELEGRAM_BOT_TOKEN = "8230689629:AAHtpdsVb8znDZ_DyKMzcOgee-aczA9acOE"
-TELEGRAM_CHAT_ID = "8258742558"
+# Support multiple chat IDs - can be a single ID or comma-separated list
+TELEGRAM_CHAT_IDS = os.getenv("TELEGRAM_CHAT_IDS", "8258742558,6012220041")  # Can be: "123,456,789" or single "123"
 PRE_MARKET_START = "03:59"
 PRE_MARKET_END = "09:30"
 ALERT_COOLDOWN_MINUTES = 5
@@ -66,7 +67,11 @@ minute_aggregates = defaultdict(lambda: defaultdict(lambda: {
     'volume': 0, 'value': 0, 'count': 0, 'vwap': 0
 }))
 # Track quotes for spread calculation
-latest_quotes = {}  # {symbol: {'bid': price, 'ask': price, 'timestamp': ts}}
+latest_quotes = {}  # {symbol: {'bid': price, 'ask': price, 'timestamp': ts, 'bid_size': size, 'ask_size': size}}
+# Track trade flow for pressure analysis (last 2 minutes)
+trade_flow_data = defaultdict(lambda: [])  # {symbol: [(timestamp, price, size, side)]}
+# Track pressure index history (last 10 minutes)
+pressure_index_history = defaultdict(lambda: [])  # {symbol: [(timestamp, pressure_index, interpretation)]}
 # Track 3-minute rolling volume for comparison
 rolling_volume_3min = defaultdict(lambda: [0, 0, 0])  # last 3 minutes of volume
 # Track price action for structure validation
@@ -251,21 +256,42 @@ def fetch_recent_news(symbol, limit=1):
     return []
 
 def send_telegram(message):
-    """Send Telegram message unless DISABLE_NOTIFICATIONS flag set."""
+    """Send Telegram message to all configured chat IDs unless DISABLE_NOTIFICATIONS flag set."""
     if DISABLE_NOTIFICATIONS:
         return False  # Suppressed during backtests / tuning
+    
+    # Parse chat IDs (support comma-separated list)
+    chat_ids = [cid.strip() for cid in TELEGRAM_CHAT_IDS.split(',') if cid.strip()]
+    
+    if not chat_ids:
+        print("No Telegram chat IDs configured")
+        return False
+    
+    success = True
     with telegram_lock:
-        try:
-            url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-            response = requests.post(
-                url,
-                data={'chat_id': TELEGRAM_CHAT_ID, 'text': message, 'parse_mode': 'HTML'},
-                timeout=10
-            )
-            return response.status_code == 200
-        except Exception as e:
-            print(f"Telegram error: {e}")
-            return False
+        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+        
+        for chat_id in chat_ids:
+            try:
+                response = requests.post(
+                    url,
+                    data={'chat_id': chat_id, 'text': message, 'parse_mode': 'HTML'},
+                    timeout=30  # Increased from 10 to 30 seconds
+                )
+                if response.status_code != 200:
+                    print(f"⚠ Telegram error for chat {chat_id}: {response.status_code}")
+                    success = False
+            except requests.exceptions.Timeout:
+                print(f"⚠ Telegram timeout for chat {chat_id} (30s) - skipping")
+                success = False
+            except requests.exceptions.ConnectionError as e:
+                print(f"⚠ Telegram connection error for chat {chat_id}: Network unreachable")
+                success = False
+            except Exception as e:
+                print(f"⚠ Telegram error for chat {chat_id}: {e}")
+                success = False
+        
+        return success
 
 def can_send_alert(symbol, minute_ts):
     """Check if alert can be sent (respects cooldown)"""
@@ -281,9 +307,10 @@ def mark_alerted(symbol, minute_ts):
     alert_tracker[symbol] = minute_ts
 
 def save_previous_minute():
-    """Save minute aggregates to JSON file"""
+    """Save minute aggregates and latest quotes to JSON file"""
     try:
         filename = os.path.join("data", f"minute_data_{get_et_time().strftime('%Y%m%d')}.json")
+        quotes_filename = os.path.join("data", f"quotes_data_{get_et_time().strftime('%Y%m%d')}.json")
         
         with data_lock:
             # Convert to serializable format
@@ -298,43 +325,95 @@ def save_previous_minute():
             json.dump(save_data, f, indent=2)
         
         print(f"✓ Saved {len(save_data)} minutes of data")
+        
+        # Save latest quotes
+        with quote_lock:
+            quotes_data = {}
+            for symbol, quote in latest_quotes.items():
+                quotes_data[symbol] = {
+                    'bid': quote.get('bid'),
+                    'ask': quote.get('ask'),
+                    'bid_size': quote.get('bid_size'),
+                    'ask_size': quote.get('ask_size'),
+                    'timestamp': quote.get('timestamp').strftime('%Y-%m-%d %H:%M:%S') if quote.get('timestamp') else None
+                }
+        
+        with open(quotes_filename, 'w') as f:
+            json.dump(quotes_data, f, indent=2)
+        
+        print(f"✓ Saved {len(quotes_data)} quotes")
         return True
     except Exception as e:
         print(f"Save error: {e}")
         return False
 
 def load_previous_minute():
-    """Load minute aggregates from JSON file"""
+    """Load minute aggregates and latest quotes from JSON file"""
     filename = os.path.join("data", f"minute_data_{get_et_time().strftime('%Y%m%d')}.json")
+    quotes_filename = os.path.join("data", f"quotes_data_{get_et_time().strftime('%Y%m%d')}.json")
     
-    if not os.path.exists(filename):
-        print("📂 No previous data found")
-        return False
+    success = False
     
-    try:
-        with open(filename, 'r') as f:
-            save_data = json.load(f)
-        
-        with data_lock:
-            minute_aggregates.clear()
-            for minute_key, symbols in save_data.items():
-                minute_ts = datetime.strptime(minute_key, '%Y-%m-%d %H:%M:%S')
-                for symbol, agg in symbols.items():
-                    minute_aggregates[minute_ts][symbol] = agg
-        
-        print(f"✓ Loaded {len(save_data)} minutes of data")
-        return True
-    except json.JSONDecodeError as e:
-        print(f"⚠️ Corrupted data file {filename}: {e}")
-        print(f"   Renaming to {filename}.corrupt and starting fresh")
+    # Load minute aggregates
+    if os.path.exists(filename):
         try:
-            os.rename(filename, f"{filename}.corrupt")
-        except:
-            pass
-        return False
-    except Exception as e:
-        print(f"Load error: {e}")
-        return False
+            with open(filename, 'r') as f:
+                save_data = json.load(f)
+            
+            with data_lock:
+                minute_aggregates.clear()
+                for minute_key, symbols in save_data.items():
+                    minute_ts = datetime.strptime(minute_key, '%Y-%m-%d %H:%M:%S')
+                    for symbol, agg in symbols.items():
+                        minute_aggregates[minute_ts][symbol] = agg
+            
+            print(f"✓ Loaded {len(save_data)} minutes of data")
+            success = True
+        except json.JSONDecodeError as e:
+            print(f"⚠️ Corrupted data file {filename}: {e}")
+            print(f"   Renaming to {filename}.corrupt and starting fresh")
+            try:
+                os.rename(filename, f"{filename}.corrupt")
+            except:
+                pass
+        except Exception as e:
+            print(f"Load error: {e}")
+    else:
+        print("📂 No previous minute data found")
+    
+    # Load latest quotes
+    if os.path.exists(quotes_filename):
+        try:
+            with open(quotes_filename, 'r') as f:
+                quotes_data = json.load(f)
+            
+            with quote_lock:
+                latest_quotes.clear()
+                for symbol, quote in quotes_data.items():
+                    timestamp_str = quote.get('timestamp')
+                    latest_quotes[symbol] = {
+                        'bid': quote.get('bid'),
+                        'ask': quote.get('ask'),
+                        'bid_size': quote.get('bid_size'),
+                        'ask_size': quote.get('ask_size'),
+                        'timestamp': datetime.strptime(timestamp_str, '%Y-%m-%d %H:%M:%S').replace(tzinfo=ET_TIMEZONE) if timestamp_str else get_et_time()
+                    }
+            
+            print(f"✓ Loaded {len(quotes_data)} quotes")
+            success = True
+        except json.JSONDecodeError as e:
+            print(f"⚠️ Corrupted quotes file {quotes_filename}: {e}")
+            print(f"   Renaming to {quotes_filename}.corrupt and starting fresh")
+            try:
+                os.rename(quotes_filename, f"{quotes_filename}.corrupt")
+            except:
+                pass
+        except Exception as e:
+            print(f"Load quotes error: {e}")
+    else:
+        print("📂 No previous quotes data found")
+    
+    return success
 
 
 def get_spread_ratio(symbol, fallback_price=None):
@@ -373,11 +452,6 @@ def get_spread_ratio(symbol, fallback_price=None):
     
     return None
 
-def get_prev_3min_volume(symbol):
-    """Get volume from 3 minutes ago for comparison"""
-    vols = rolling_volume_3min.get(symbol, [0, 0, 0])
-    return vols[0] if vols else 0
-
 def update_rolling_volume(symbol, current_volume):
     """Shift rolling 3-minute volume window"""
     vols = rolling_volume_3min[symbol]
@@ -412,13 +486,223 @@ def normalize_timestamp(ts):
         dt = ts if ts.tzinfo else ts.replace(tzinfo=ET_TIMEZONE)
     return dt
 
+def update_trade_flow(symbol, timestamp, price, size, side):
+    """
+    Track recent trades for aggressive order analysis
+    
+    Args:
+        symbol: Stock ticker
+        timestamp: Trade timestamp
+        price: Trade price
+        size: Trade size (shares)
+        side: 'buy' (at ask) or 'sell' (at bid)
+    """
+    dt = normalize_timestamp(timestamp)
+    trade_flow_data[symbol].append((dt, price, size, side))
+    
+    # Keep only last 2 minutes of trades
+    cutoff = dt - timedelta(minutes=2)
+    trade_flow_data[symbol] = [(t, p, s, sd) for t, p, s, sd in trade_flow_data[symbol] if t > cutoff]
+
+def compute_bid_ask_pressure_index(symbol, current_price, session="REGULAR"):
+    """
+    Calculate Bid/Ask Pressure Index using order book depth and aggressive trade flow
+    
+    Combines two components:
+    1. Order Book Depth Score - weighted by distance from current price
+    2. Aggressive Trade Score - buy vs sell pressure from recent trades
+    
+    Args:
+        symbol: Stock ticker
+        current_price: Current market price
+        session: Trading session (for parameter adjustments)
+    
+    Returns:
+        dict with:
+            - pressure_index: 0.0-1.0 (0=strong sell, 1=strong buy, 0.4-0.6=neutral)
+            - interpretation: String description
+            - depth_score: Order book component
+            - aggressive_score: Trade flow component
+            - bid_pressure: Weighted bid depth
+            - ask_pressure: Weighted ask depth
+            - buy_volume: Recent aggressive buy volume
+            - sell_volume: Recent aggressive sell volume
+    """
+    
+    # Configuration parameters
+    MAX_DISTANCE = 0.05  # 5% away from current price (in price terms)
+    WEIGHT_DEPTH = 0.4   # Weight for order book depth score
+    WEIGHT_AGGRESSIVE = 0.6  # Weight for aggressive trade score (trades more reliable)
+    
+    # === 1️⃣ Weighted Order Book Depth Score ===
+    # Use latest quote data for bid/ask
+    quote = latest_quotes.get(symbol, {})
+    bid_price = quote.get('bid', 0)
+    ask_price = quote.get('ask', 0)
+    bid_size = quote.get('bid_size', 0)
+    ask_size = quote.get('ask_size', 0)
+    
+    bid_weighted_sum = 0
+    ask_weighted_sum = 0
+    
+    if bid_price > 0 and current_price > 0:
+        distance = abs(bid_price - current_price) / current_price
+        if distance <= MAX_DISTANCE:
+            weight = 1 / (1 + distance * 100)  # Closer orders weigh more
+            bid_weighted_sum = bid_size * weight
+    
+    if ask_price > 0 and current_price > 0:
+        distance = abs(ask_price - current_price) / current_price
+        if distance <= MAX_DISTANCE:
+            weight = 1 / (1 + distance * 100)
+            ask_weighted_sum = ask_size * weight
+    
+    # Calculate depth score (0-1 range)
+    total_depth = bid_weighted_sum + ask_weighted_sum
+    if total_depth > 0:
+        depth_score = bid_weighted_sum / total_depth
+    else:
+        depth_score = 0.5  # Neutral if no data
+    
+    # === 2️⃣ Aggressive Trade Score ===
+    trades = trade_flow_data.get(symbol, [])
+    
+    # Calculate average trade size for threshold
+    if trades:
+        avg_trade_size = sum(size for _, _, size, _ in trades) / len(trades)
+        large_trade_threshold = avg_trade_size * 3  # Consider trades 3x average as "large"
+    else:
+        large_trade_threshold = 100  # Default threshold
+    
+    agg_buy = 0
+    agg_sell = 0
+    
+    for timestamp, price, size, side in trades:
+        # Focus on larger trades for more reliable signal
+        if size >= large_trade_threshold:
+            if side == 'buy':
+                agg_buy += size
+            elif side == 'sell':
+                agg_sell += size
+    
+    # Calculate aggressive score
+    total_aggressive = agg_buy + agg_sell
+    if total_aggressive > 0:
+        agg_score = (agg_buy - agg_sell) / total_aggressive  # Range -1 to +1
+        agg_score_normalized = (agg_score + 1) / 2  # Convert to 0-1
+    else:
+        agg_score_normalized = 0.5  # Neutral if no large trades
+    
+    # === 3️⃣ Combine Scores into Pressure Index ===
+    pressure_index = WEIGHT_DEPTH * depth_score + WEIGHT_AGGRESSIVE * agg_score_normalized
+    
+    # === 4️⃣ Interpretation ===
+    if pressure_index > 0.70:
+        interpretation = "🟢 STRONG BUYING"
+        alert_worthy = True
+    elif pressure_index > 0.60:
+        interpretation = "🟢 Moderate Buying"
+        alert_worthy = False
+    elif pressure_index >= 0.40:
+        interpretation = "⚪ Neutral/Balanced"
+        alert_worthy = False
+    elif pressure_index >= 0.30:
+        interpretation = "🔴 Moderate Selling"
+        alert_worthy = False
+    else:
+        interpretation = "🔴 STRONG SELLING"
+        alert_worthy = True
+    
+    # Store in history
+    dt = get_et_time()
+    pressure_index_history[symbol].append((dt, pressure_index, interpretation))
+    
+    # Keep only last 10 minutes of history
+    cutoff = dt - timedelta(minutes=10)
+    pressure_index_history[symbol] = [(t, pi, interp) for t, pi, interp in pressure_index_history[symbol] if t > cutoff]
+    
+    return {
+        'pressure_index': pressure_index,
+        'interpretation': interpretation,
+        'alert_worthy': alert_worthy,
+        'depth_score': depth_score,
+        'aggressive_score': agg_score_normalized,
+        'bid_pressure': bid_weighted_sum,
+        'ask_pressure': ask_weighted_sum,
+        'buy_volume': agg_buy,
+        'sell_volume': agg_sell,
+        'total_trades': len(trades),
+        'large_trades': sum(1 for _, _, size, _ in trades if size >= large_trade_threshold)
+    }
+
+def get_pressure_trend(symbol, lookback_minutes=5):
+    """
+    Analyze pressure index trend over recent history
+    
+    Returns:
+        dict with trend analysis (strengthening/weakening/stable)
+    """
+    history = pressure_index_history.get(symbol, [])
+    
+    if len(history) < 3:
+        return {
+            'trend': 'insufficient_data',
+            'direction': 'unknown',
+            'strength': 0
+        }
+    
+    # Get recent pressure values
+    cutoff = get_et_time() - timedelta(minutes=lookback_minutes)
+    recent = [(t, pi) for t, pi, _ in history if t > cutoff]
+    
+    if len(recent) < 2:
+        return {
+            'trend': 'insufficient_data',
+            'direction': 'unknown',
+            'strength': 0
+        }
+    
+    # Calculate trend (simple linear regression slope)
+    values = [pi for _, pi in recent]
+    n = len(values)
+    
+    # Simple slope calculation
+    if n >= 2:
+        first_half_avg = sum(values[:n//2]) / (n//2)
+        second_half_avg = sum(values[n//2:]) / (n - n//2)
+        slope = second_half_avg - first_half_avg
+        
+        if slope > 0.15:
+            trend = 'strengthening_buy'
+            direction = 'bullish'
+            strength = min(slope * 3, 1.0)
+        elif slope < -0.15:
+            trend = 'strengthening_sell'
+            direction = 'bearish'
+            strength = min(abs(slope) * 3, 1.0)
+        else:
+            trend = 'stable'
+            direction = 'neutral'
+            strength = 0.5
+    else:
+        trend = 'stable'
+        direction = 'neutral'
+        strength = 0.5
+    
+    return {
+        'trend': trend,
+        'direction': direction,
+        'strength': strength,
+        'sample_size': n
+    }
+
 def BASE_VOL_THRESH(session):
     """Return base volume threshold for session."""
-    return {"PREMARKET": 30000, "REGULAR": 90000, "POSTMARKET": 24000}.get(session, 90000)
+    return {"PREMARKET": 30000, "REGULAR": 70000, "POSTMARKET": 24000}.get(session, 90000)
 
 def BASE_PCT_THRESH(session):
     """Return base percentage threshold for session."""
-    return {"PREMARKET": 3.8, "REGULAR": 4.5, "POSTMARKET": 3.8}.get(session, 4.5)
+    return {"PREMARKET": 3.8, "REGULAR": 3.8, "POSTMARKET": 3.8}.get(session, 4.5)
 
 def get_spread_limit(session):
     """Return spread limit for session."""
@@ -428,59 +712,49 @@ def get_recent_prices(symbol, n=3):
     """Get last n closing prices for symbol from minute aggregates."""
     prices = []
     
-    # Normalize all keys to timezone-aware datetimes for comparison
+    # Get all minute keys that have data for this symbol, sorted by time
     try:
-        normalized_minutes = []
-        for minute_ts in minute_aggregates.keys():
-            if isinstance(minute_ts, datetime):
-                if minute_ts.tzinfo is None:
-                    # Make naive datetime timezone-aware
-                    normalized_minutes.append(minute_ts.replace(tzinfo=ET_TIMEZONE))
-                else:
-                    normalized_minutes.append(minute_ts)
+        # Build list of (timestamp, symbol_data) tuples
+        symbol_minutes = []
+        for minute_ts, symbols_data in minute_aggregates.items():
+            if symbol in symbols_data and symbols_data[symbol].get('close'):
+                symbol_minutes.append((minute_ts, symbols_data[symbol]['close']))
         
-        sorted_minutes = sorted(normalized_minutes, reverse=True)
-    except Exception:
-        # Fallback: just get last n items without sorting by time
-        sorted_minutes = list(minute_aggregates.keys())[-n:]
+        # Sort by timestamp (descending - most recent first)
+        symbol_minutes.sort(key=lambda x: x[0], reverse=True)
+        
+        # Take the n most recent prices
+        for _, close_price in symbol_minutes[:n]:
+            prices.append(close_price)
+            
+    except Exception as e:
+        pass  # Return empty list on error
     
-    for minute_ts in sorted_minutes[:n]:
-        agg = minute_aggregates[minute_ts].get(symbol)
-        if agg and agg.get('close'):
-            prices.append(agg['close'])
-        if len(prices) >= n:
-            break
-    
-    return prices[::-1]  # Return in chronological order
+    return prices[::-1]  # Return in chronological order (oldest to newest)
 
 def get_recent_vwaps(symbol, n=3):
     """Get last n VWAPs for symbol from minute aggregates."""
     vwaps = []
     
-    # Normalize all keys to timezone-aware datetimes for comparison
+    # Get all minute keys that have data for this symbol, sorted by time
     try:
-        normalized_minutes = []
-        for minute_ts in minute_aggregates.keys():
-            if isinstance(minute_ts, datetime):
-                if minute_ts.tzinfo is None:
-                    # Make naive datetime timezone-aware
-                    normalized_minutes.append(minute_ts.replace(tzinfo=ET_TIMEZONE))
-                else:
-                    normalized_minutes.append(minute_ts)
+        # Build list of (timestamp, vwap) tuples
+        symbol_minutes = []
+        for minute_ts, symbols_data in minute_aggregates.items():
+            if symbol in symbols_data and symbols_data[symbol].get('vwap'):
+                symbol_minutes.append((minute_ts, symbols_data[symbol]['vwap']))
         
-        sorted_minutes = sorted(normalized_minutes, reverse=True)
-    except Exception:
-        # Fallback: just get last n items without sorting by time
-        sorted_minutes = list(minute_aggregates.keys())[-n:]
+        # Sort by timestamp (descending - most recent first)
+        symbol_minutes.sort(key=lambda x: x[0], reverse=True)
+        
+        # Take the n most recent VWAPs
+        for _, vwap_value in symbol_minutes[:n]:
+            vwaps.append(vwap_value)
+            
+    except Exception as e:
+        pass  # Return empty list on error
     
-    for minute_ts in sorted_minutes[:n]:
-        agg = minute_aggregates[minute_ts].get(symbol)
-        if agg and agg.get('vwap'):
-            vwaps.append(agg['vwap'])
-        if len(vwaps) >= n:
-            break
-    
-    return vwaps[::-1]  # Return in chronological order
+    return vwaps[::-1]  # Return in chronological order (oldest to newest)
 
 def vwap_bias(symbol, n=3):
     """Check if last n bars are above or below VWAP.
@@ -655,11 +929,11 @@ def check_momentum(symbol, current_pct, current_vol, minute_ts, open_price, clos
     # Dynamic volume threshold
     if avg_vol_20d is not None:
         if session == "PREMARKET":
-            vol_multiplier = 0.015
+            vol_multiplier = 0.0005
         elif session == "POSTMARKET":
-            vol_multiplier = 0.02
+            vol_multiplier = 0.0005
         else:  # REGULAR
-            vol_multiplier = 0.10
+            vol_multiplier = 0.015
         vol_thresh = max(BASE_VOL_THRESH(session), avg_vol_20d * vol_multiplier)
     else:
         vol_thresh = BASE_VOL_THRESH(session)
@@ -723,7 +997,7 @@ def check_momentum(symbol, current_pct, current_vol, minute_ts, open_price, clos
     # === 4. Check for Stage 1 setup (Early Entry) ===
     if symbol not in stage1_alerts:
         # Not yet in Stage 1, check if we should enter
-        if momentum_likelihood >= 0.75 and acceleration > 0:
+        if momentum_likelihood >= 0.6 and acceleration >= 0 and current_vol > vol_thresh and current_pct > 0:
             # Strong momentum setup detected! Send early alert
             stage1_alerts[symbol] = {
                 'time': dt,
@@ -740,15 +1014,27 @@ def check_momentum(symbol, current_pct, current_vol, minute_ts, open_price, clos
             if can_send_alert(symbol, dt):
                 mark_alerted(symbol, dt)
                 spread_display = f"{spread_ratio:.3f}" if spread_ratio is not None else "n/a"
+                
+                # Calculate bid/ask pressure for context
+                pressure_data = compute_bid_ask_pressure_index(symbol, price, session)
+                pressure_text = ""
+                if pressure_data['total_trades'] > 0:
+                    pi = pressure_data['pressure_index']
+                    pressure_text = (f"\n\n📊 Order Flow:\n"
+                                   f"Pressure Index: {pi:.2f} - {pressure_data['interpretation']}\n"
+                                   f"Buy: {pressure_data['buy_volume']:,} | Sell: {pressure_data['sell_volume']:,}\n"
+                                   f"Bid/Ask: {(pressure_data['bid_pressure']/(pressure_data['ask_pressure']+1)):.2f}:1")
+                
                 send_telegram(
                     f"🚀 EARLY MOMENTUM DETECTED ({session})\n"
                     f"{symbol} @ ${price:.2f}\n"
                     f"Likelihood: {momentum_likelihood:.2f} | Acceleration: +{acceleration:.2f}\n"
                     f"Accumulated Bars: {accumulated_momentum} | Pct: +{current_pct:.2f}%\n"
-                    f"RelVol: {rel_vol:.2f}x | Vol: {current_vol:,}\n"
+                    f"RelVol: {rel_vol:.2f}x | Vol: {current_vol:,} ( > {vol_thresh:.2f})\n"
                     f"VWAP: {vwap_trend} | Spread: {spread_display}\n"
                     f"{dt.strftime('%I:%M:%S %p ET')}\n"
                     f"⚠️ Probabilistic entry - awaiting confirmation"
+                    f"{pressure_text}"
                 )
                 
                 return {
@@ -862,15 +1148,30 @@ def check_momentum(symbol, current_pct, current_vol, minute_ts, open_price, clos
                             news_text += f"  💭 {reasoning}\n"
                 
                 spread_display = f"{spread_ratio:.3f}" if spread_ratio is not None else "n/a"
+                vol_ratio = current_vol / vol_thresh if vol_thresh > 0 else 0
+                
+                # Calculate bid/ask pressure for context
+                pressure_data = compute_bid_ask_pressure_index(symbol, price, session)
+                pressure_text = ""
+                if pressure_data['total_trades'] > 0:
+                    pi = pressure_data['pressure_index']
+                    trend_data = get_pressure_trend(symbol, lookback_minutes=5)
+                    trend_emoji = "📈" if trend_data['direction'] == 'bullish' else "📉" if trend_data['direction'] == 'bearish' else "➡️"
+                    pressure_text = (f"\n\n📊 Order Flow:\n"
+                                   f"Pressure Index: {pi:.2f} - {pressure_data['interpretation']} {trend_emoji}\n"
+                                   f"Buy: {pressure_data['buy_volume']:,} | Sell: {pressure_data['sell_volume']:,}\n"
+                                   f"Bid/Ask: {(pressure_data['bid_pressure']/(pressure_data['ask_pressure']+1)):.2f}:1 | Large Trades: {pressure_data['large_trades']}/{pressure_data['total_trades']}")
+                
                 send_telegram(
                     f"🔥 CONFIRMED MOMENTUM ({session})\n"
                     f"{symbol} @ ${price:.2f}\n"
                     f"Setup: ${setup['setup_price']:.2f} → Follow-through: +{follow_through:.2f}%\n"
-                    f"Quality: {quality:.1f}/100 | RelVol: {rel_vol:.2f}x | Vol: {current_vol:,}\n"
+                    f"Quality: {quality:.1f}/100 | RelVol: {rel_vol:.2f}x | Vol: {current_vol:,} ({vol_ratio:.1f}x thresh)\n"
                     f"Pct: +{current_pct:.2f}% | VWAP: {vwap_trend}\n"
                     f"Spread: {spread_display} | Trades: {trade_count}\n"
                     f"Bars Confirmed: {setup['bars_confirmed']}\n"
                     f"{dt.strftime('%I:%M:%S %p ET')}"
+                    f"{pressure_text}"
                     f"{news_text}"
                 )
                 
@@ -929,8 +1230,9 @@ def update_aggregates(symbol, price, size, timestamp):
         agg['value'] += price * size
         agg['count'] += 1
         
-        # Calculate VWAP
+        # Calculate VWAP and store it
         vwap = agg['value'] / agg['volume'] if agg['volume'] > 0 else price
+        agg['vwap'] = vwap
         
         # Calculate percentage change within the current minute (open to close)
         pct_change = 0
@@ -953,12 +1255,14 @@ def handle_msg(msgs):
             elif hasattr(msg, 'event_type'):
                 event_type = msg.event_type
             
-            # Handle quote messages for spread calculation
+            # Handle quote messages for spread calculation and pressure analysis
             if event_type == 'Q':
                 # Check for both old and new attribute names
                 symbol = getattr(msg, 'sym', None) or getattr(msg, 'symbol', None)
                 bid = getattr(msg, 'bp', None) or getattr(msg, 'bid_price', None)
                 ask = getattr(msg, 'ap', None) or getattr(msg, 'ask_price', None)
+                bid_size = getattr(msg, 'bs', None) or getattr(msg, 'bid_size', 0)
+                ask_size = getattr(msg, 'as', None) or getattr(msg, 'ask_size', 0)
                 
                 if symbol and bid and ask:
                     if symbol in target_tickers:
@@ -966,6 +1270,8 @@ def handle_msg(msgs):
                             latest_quotes[symbol] = {
                                 'bid': bid,
                                 'ask': ask,
+                                'bid_size': bid_size,
+                                'ask_size': ask_size,
                                 'timestamp': get_et_time()
                             }
                 continue
@@ -981,6 +1287,23 @@ def handle_msg(msgs):
             price = msg.price
             size = msg.size
             timestamp = msg.timestamp
+            
+            # Determine trade side (buy at ask or sell at bid)
+            quote = latest_quotes.get(symbol, {})
+            bid = quote.get('bid', 0)
+            ask = quote.get('ask', 0)
+            
+            # Classify trade as buy or sell based on price relative to bid/ask
+            if ask > 0 and abs(price - ask) < abs(price - bid):
+                trade_side = 'buy'  # Trade at or near ask = buyer initiated
+            elif bid > 0 and abs(price - bid) < abs(price - ask):
+                trade_side = 'sell'  # Trade at or near bid = seller initiated
+            else:
+                # If no quote or price in middle, use size heuristic
+                trade_side = 'buy' if size > 100 else 'sell'
+            
+            # Update trade flow for pressure analysis
+            update_trade_flow(symbol, timestamp, price, size, trade_side)
             
             # Update price history for structure analysis
             update_price_history(symbol, get_et_time(), price, size)
@@ -1006,6 +1329,9 @@ def handle_msg(msgs):
             # Check for momentum on every trade (real-time detection)
             check_momentum(symbol, pct_change, volume, minute_ts, open_price, close_price, trade_count, vwap)
             
+            # Calculate bid/ask pressure index periodically (every 30 seconds)
+            # Pressure data is now included in spike alerts, no separate pressure alerts needed
+            
         except Exception as e:
             import traceback
             print(f"Error processing message: {e}")
@@ -1022,42 +1348,64 @@ def run_session():
     with data_lock:
         alert_tracker.clear()
     
-    try:
-        client = WebSocketClient(
-            api_key=API_KEY,
-            feed=Feed.RealTime,
-            market=Market.Stocks
-        )
-        
-        # Subscribe to trades and quotes for spread calculation
-        client.subscribe('T.*')  # All trades
-        client.subscribe('Q.*')  # All quotes
-        
-        # Run in background thread
-        ws_running = [True]
-        
-        def ws_runner():
-            try:
-                client.run(handle_msg)
-            except Exception as e:
-                print(f"WebSocket error: {e}")
-                ws_running[0] = False
-        
-        ws_thread = threading.Thread(target=ws_runner, daemon=True)
-        ws_thread.start()
-        
-        # Monitor session - run during any active trading session
-        while is_active_trading_session() and ws_running[0]:
-            time.sleep(5)
-        
-        ws_running[0] = False
-        print(f"✓ Session ended: {get_et_time().strftime('%H:%M:%S ET')}")
-        
-        # Save data at end of session
-        save_previous_minute()
-        
-    except Exception as e:
-        print(f"Session error: {e}")
+    retry_count = 0
+    max_retries = 5
+    base_delay = 5  # seconds
+    
+    while is_active_trading_session() and retry_count < max_retries:
+        try:
+            if retry_count > 0:
+                delay = min(base_delay * (2 ** (retry_count - 1)), 60)  # Exponential backoff, max 60s
+                print(f"🔄 Reconnecting in {delay}s... (attempt {retry_count + 1}/{max_retries})")
+                time.sleep(delay)
+            
+            client = WebSocketClient(
+                api_key=API_KEY,
+                feed=Feed.RealTime,
+                market=Market.Stocks
+            )
+            
+            # Subscribe to trades and quotes for spread calculation
+            client.subscribe('T.*')  # All trades
+            client.subscribe('Q.*')  # All quotes
+            
+            # Run in background thread
+            ws_running = [True]
+            
+            def ws_runner():
+                try:
+                    client.run(handle_msg)
+                except Exception as e:
+                    print(f"⚠ WebSocket error: {e}")
+                    ws_running[0] = False
+            
+            ws_thread = threading.Thread(target=ws_runner, daemon=True)
+            ws_thread.start()
+            
+            # Monitor session - run during any active trading session
+            while is_active_trading_session() and ws_running[0]:
+                time.sleep(5)
+            
+            ws_running[0] = False
+            
+            # Check if we exited because session ended or because of error
+            if not is_active_trading_session():
+                print(f"✓ Session ended: {get_et_time().strftime('%H:%M:%S ET')}")
+                break
+            else:
+                # WebSocket failed during active session, try to reconnect
+                print(f"⚠ WebSocket disconnected during active session")
+                retry_count += 1
+                
+        except Exception as e:
+            print(f"⚠ Session error: {e}")
+            retry_count += 1
+    
+    if retry_count >= max_retries:
+        print(f"❌ Max reconnection attempts ({max_retries}) reached. Exiting session.")
+    
+    # Save data at end of session
+    save_previous_minute()
 
 def main():
     """Main function"""

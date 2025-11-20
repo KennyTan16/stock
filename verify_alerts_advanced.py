@@ -46,31 +46,113 @@ def load_historical_stats(symbol):
     return {'avg_volume': None, 'avg_range': None}
 
 def fetch_data(symbol, date, start_time, end_time):
-    """Fetch minute data from Polygon API"""
-    url = f"https://api.polygon.io/v2/aggs/ticker/{symbol}/range/1/minute/{date}/{date}"
-    params = {
-        'apiKey': API_KEY,
-        'adjusted': 'true',
-        'sort': 'asc',
-        'limit': 50000
-    }
+    """Fetch minute data from historical flatfiles CSV or fall back to Polygon API"""
+    import gzip
+    from pathlib import Path
     
-    print(f"📡 Fetching {symbol} data from Polygon API...")
+    # Try to load from historical flatfiles first
+    flatfile_path = Path(f"historical_data/polygon_flatfiles_minute/{date}.csv.gz")
     
-    response = requests.get(url, params=params, timeout=30)
+    if flatfile_path.exists():
+        print(f"📂 Loading {symbol} data from historical flatfile: {date}.csv.gz")
+        
+        try:
+            bars = []
+            with gzip.open(flatfile_path, 'rt') as f:
+                reader = csv.DictReader(f)
+                for row in reader:
+                    ticker = row['ticker']
+                    
+                    # Filter to only our symbol
+                    if ticker != symbol:
+                        continue
+                    
+                    # Parse bar data
+                    timestamp_ns = int(row['window_start'])
+                    timestamp_ms = timestamp_ns // 1_000_000  # Convert nanoseconds to milliseconds
+                    
+                    open_price = float(row['open'])
+                    close_price = float(row['close'])
+                    high_price = float(row['high'])
+                    low_price = float(row['low'])
+                    volume = int(row['volume'])
+                    transactions = int(row['transactions'])
+                    
+                    # Calculate VWAP approximation (use average of high/low/close)
+                    vwap = (high_price + low_price + close_price) / 3
+                    
+                    bars.append({
+                        'timestamp': timestamp_ms,
+                        'open': open_price,
+                        'high': high_price,
+                        'low': low_price,
+                        'close': close_price,
+                        'volume': volume,
+                        'vwap': vwap,
+                        'transactions': transactions
+                    })
+            
+            if not bars:
+                print(f"⚠️ No data found for {symbol} in flatfile, trying API...")
+            else:
+                print(f"✓ Loaded {len(bars)} bars from flatfile for {symbol}")
+                # Convert to same format as API response
+                results = []
+                for bar in bars:
+                    results.append({
+                        't': bar['timestamp'],
+                        'o': bar['open'],
+                        'h': bar['high'],
+                        'l': bar['low'],
+                        'c': bar['close'],
+                        'v': bar['volume'],
+                        'vw': bar['vwap'],
+                        'n': bar['transactions']
+                    })
+                # Skip to processing section below
+                if results:
+                    print(f"✓ Received {len(results)} total bars for {date}")
+                    # Continue with time filtering below
+                    data = {'results': results}
+                    # Jump to time filtering
+                    pass  # Will continue to time filtering below
+                else:
+                    results = None
+                    
+        except Exception as e:
+            print(f"⚠️ Error reading flatfile: {e}, trying API...")
+            results = None
+    else:
+        print(f"📡 Flatfile not found, fetching {symbol} data from Polygon API...")
+        results = None
     
-    if response.status_code != 200:
-        print(f"❌ API Error: {response.status_code}")
-        return None
-    
-    data = response.json()
-    
-    if data.get('status') != 'OK':
-        print(f"❌ API returned status: {data.get('status')}")
-        return None
-    
-    results = data.get('results', [])
-    print(f"✓ Received {len(results)} total bars for {date}")
+    # Fall back to API if flatfile not available or had no data
+    if results is None:
+        url = f"https://api.polygon.io/v2/aggs/ticker/{symbol}/range/1/minute/{date}/{date}"
+        params = {
+            'apiKey': API_KEY,
+            'adjusted': 'true',
+            'sort': 'asc',
+            'limit': 50000
+        }
+        
+        response = requests.get(url, params=params, timeout=30)
+        
+        if response.status_code != 200:
+            print(f"❌ API Error: {response.status_code}")
+            return None
+        
+        data = response.json()
+        
+        if data.get('status') != 'OK':
+            print(f"❌ API returned status: {data.get('status')}")
+            return None
+        
+        results = data.get('results', [])
+        print(f"✓ Received {len(results)} total bars for {date}")
+    else:
+        # Using data from flatfile
+        results = data.get('results', [])
     
     # Filter for time range and convert
     et_tz = pytz.timezone('America/New_York')
